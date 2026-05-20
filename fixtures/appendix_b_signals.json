@@ -1,0 +1,210 @@
+[
+  {
+    "id": 1,
+    "raw_text": "🚀 BTC LONG\nEntry: 65000-65500\nTP: 70000\nSL: 63000\nLeverage: 10x",
+    "expected": {
+      "is_signal": true,
+      "symbol": "BTC",
+      "side": "buy",
+      "entry_prices": [65000, 65500],
+      "take_profits": [70000],
+      "stop_loss": 63000,
+      "leverage": 10
+    }
+  },
+  {
+    "id": 2,
+    "raw_text": "ETH SHORT 🔴\n\nEntry zone: 3200 - 3250\nTP1: 3000\nTP2: 2800\nTP3: 2500\nSL: 3350\nLev: 5x\n\n⚡ High confidence setup",
+    "expected": {
+      "is_signal": true,
+      "symbol": "ETH",
+      "side": "sell",
+      "entry_prices": [3200, 3250],
+      "take_profits": [3000, 2800, 2500],
+      "stop_loss": 3350,
+      "leverage": 5
+    }
+  },
+  {
+    "id": 3,
+    "raw_text": "SOL/USDT LONG\n📈 Entry: 145\n🎯 TP: 165\n🛡 SL: 135\n💪 Leverage: 3x\n\nConfluence with support zone, RSI oversold on 4H",
+    "expected": {
+      "is_signal": true,
+      "symbol": "SOL",
+      "side": "buy",
+      "entry_prices": [145],
+      "take_profits": [165],
+      "stop_loss": 135,
+      "leverage": 3
+    }
+  },
+  {
+    "id": 4,
+    "raw_text": "🔥 SIGNAL ALERT 🔥\n\nPair: AVAX-PERP\nDirection: LONG\nEntry: 35.50 - 36.00\nTarget 1: 40.00\nTarget 2: 45.00\nStop Loss: 33.00\nLeverage: 7x\n\nRisk: Medium",
+    "expected": {
+      "is_signal": true,
+      "symbol": "AVAX",
+      "side": "buy",
+      "entry_prices": [35.50, 36.00],
+      "take_profits": [40.00, 45.00],
+      "stop_loss": 33.00,
+      "leverage": 7
+    }
+  },
+  {
+    "id": 5,
+    "raw_text": "BNB SHORT\nEntry: 580\nTP: 520\nSL: 605\n5x leverage",
+    "expected": {
+      "is_signal": true,
+      "symbol": "BNB",
+      "side": "sell",
+      "entry_prices": [580],
+      "take_profits": [520],
+      "stop_loss": 605,
+      "leverage": 5
+    }
+  },
+  {
+    "id": 6,
+    "raw_text": "🟢 DOGE LONG\n\nEntry: 0.1420\nEntry 2: 0.1380\n\nTP1: 0.1600\nTP2: 0.1800\n\n❌ NO SL — swing trade, manage manually\n\nLeverage: 2x only",
+    "expected": {
+      "is_signal": true,
+      "symbol": "DOGE",
+      "side": "buy",
+      "entry_prices": [0.1420, 0.1380],
+      "take_profits": [0.1600, 0.1800],
+      "stop_loss": null,
+      "leverage": 2
+    }
+  },
+  {
+    "id": 7,
+    "raw_text": "📊 ARB LONG\nZone: 1.050 - 1.080\nTP: 1.250\nSL: 0.980\n\nNo leverage specified — use low leverage only",
+    "expected": {
+      "is_signal": true,
+      "symbol": "ARB",
+      "side": "buy",
+      "entry_prices": [1.050, 1.080],
+      "take_profits": [1.250],
+      "stop_loss": 0.980,
+      "leverage": null
+    }
+  },
+  {
+    "id": 8,
+    "raw_text": "⚠️ LINK SHORT SWING\n\nEntry: 14.50\nTarget: 12.00\n\n(No SL for this one — low leverage position)\n\nLeverage 2x",
+    "expected": {
+      "is_signal": true,
+      "symbol": "LINK",
+      "side": "sell",
+      "entry_prices": [14.50],
+      "take_profits": [12.00],
+      "stop_loss": null,
+      "leverage": 2
+    }
+  },
+  {
+    "id": 9,
+    "raw_text": "ADA LONG\nBuy zone: 0.43 - 0.45\nTake profit: 0.55, 0.65\nSL: 0.40\nLev: 4x",
+    "expected": {
+      "is_signal": true,
+      "symbol": "ADA",
+      "side": "buy",
+      "entry_prices": [0.43, 0.45],
+      "take_profits": [0.55, 0.65],
+      "stop_loss": 0.40,
+      "leverage": 4
+    }
+  },
+  {
+    "id": 10,
+    "raw_text": "⚡ OP SHORT SIGNAL\n\nEntry range: 2.80 - 2.90\nTP: 2.40\nNo TP2 this time\nSL: 3.05\n10x",
+    "expected": {
+      "is_signal": true,
+      "symbol": "OP",
+      "side": "sell",
+      "entry_prices": [2.80, 2.90],
+      "take_profits": [2.40],
+      "stop_loss": 3.05,
+      "leverage": 10
+    }
+  },
+  {
+    "id": 11,
+    "raw_text": "📰 MARKET UPDATE\n\nBitcoin has broken above the $64,000 resistance level with strong volume. This is a bullish continuation signal for the broader market. Altcoins are following.\n\nKey levels to watch:\n- Support: $62,000\n- Resistance: $68,000\n- Next major resistance: $72,000\n\nNot financial advice.",
+    "expected": {
+      "is_signal": false,
+      "symbol": null,
+      "side": null,
+      "entry_prices": [],
+      "take_profits": [],
+      "stop_loss": null,
+      "leverage": null
+    }
+  },
+  {
+    "id": 12,
+    "raw_text": "Good morning traders! 🌅\n\nRemember to manage your risk today. The market is looking choppy — no clear signals. Take some time off if needed.\n\nStay safe! 💪",
+    "expected": {
+      "is_signal": false,
+      "symbol": null,
+      "side": null,
+      "entry_prices": [],
+      "take_profits": [],
+      "stop_loss": null,
+      "leverage": null
+    }
+  },
+  {
+    "id": 13,
+    "raw_text": "📢 ANNOUNCEMENT\n\nWe are closing our premium channel on June 1st. All signals will be moved to our new platform. Details to follow.\n\nThank you for your support! 🙏",
+    "expected": {
+      "is_signal": false,
+      "symbol": null,
+      "side": null,
+      "entry_prices": [],
+      "take_profits": [],
+      "stop_loss": null,
+      "leverage": null
+    }
+  },
+  {
+    "id": 14,
+    "raw_text": "BTCUSDT ANALYSIS:\n\nPrice is consolidating between $63,500 and $65,000. We expect a breakout soon. Watch for a candle close above $65,000 for a long entry. Not a signal yet — waiting for confirmation.",
+    "expected": {
+      "is_signal": false,
+      "symbol": null,
+      "side": null,
+      "entry_prices": [],
+      "take_profits": [],
+      "stop_loss": null,
+      "leverage": null
+    }
+  },
+  {
+    "id": 15,
+    "raw_text": "🔴🔴🔴 URGENT SHORT SIGNAL 🔴🔴🔴\n\nXRP SHORT NOW\n⬇️ Enter: 0.5200\n🎯 TP: 0.4500\n🛡️ SL: 0.5450\n⚡ Leverage: 8x\n\n📊 Reason: Head & shoulders pattern complete, volume confirmation",
+    "expected": {
+      "is_signal": true,
+      "symbol": "XRP",
+      "side": "sell",
+      "entry_prices": [0.5200],
+      "take_profits": [0.4500],
+      "stop_loss": 0.5450,
+      "leverage": 8
+    }
+  },
+  {
+    "id": 16,
+    "raw_text": "NEAR PROTOCOL LONG 💚\n\nEntry: 5.80\nTP1: 6.50\nTP2: 7.20\nTP3: 8.00\nSL: 5.40\nLeverage: 5x\n\nFundamentals strong, ecosystem growing.",
+    "expected": {
+      "is_signal": true,
+      "symbol": "NEAR",
+      "side": "buy",
+      "entry_prices": [5.80],
+      "take_profits": [6.50, 7.20, 8.00],
+      "stop_loss": 5.40,
+      "leverage": 5
+    }
+  }
+]

@@ -1,0 +1,21 @@
+# List of Telegram channels to monitor for trading signals.
+# One channel per line — public username (with @) or numeric chat id.
+# Lines starting with # and blank lines are ignored.
+#
+# After editing this file, sync into the DB with:
+#   python -m bot channels add @example_signals
+#
+# Or import in bulk:
+#   while read line; do
+#     [[ "$line" =~ ^[[:space:]]*# ]] && continue
+#     [[ -z "$line" ]] && continue
+#     python -m bot channels add "$line"
+#   done < channels.txt
+#
+# To enable/disable a channel without removing history use:
+#   python -m bot channels list
+#   UPDATE channels SET is_active = false WHERE username = '...';  (via psql)
+#
+# Examples (replace with your own):
+# @some_signals_channel
+# @another_premium_group
