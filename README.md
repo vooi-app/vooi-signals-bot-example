@@ -341,10 +341,13 @@ The TP price target is calculated dynamically:
 TP_distance_price = (MIN_PROFIT_PCT_OF_COLLATERAL / 100 / leverage)
                   + max(actual_overhead_pct, TP_OVERHEAD_FLOOR_PCT / 100 / leverage)
 
-where actual_overhead_pct = (round_trip_taker_fees_bps
+where actual_overhead_pct = (quote_fees_bps * 2
                              + exit_slippage_bps
-                             + FUNDING_COST_BUFFER_BPS
-                             + broker_fee_bps * 2) / 10000
+                             + FUNDING_COST_BUFFER_BPS) / 10000
+
+# VOOI's quote.feesBps already includes any server-side broker / builder
+# fee, so we do not add it separately. The factor of 2 covers both the
+# entry and exit legs.
 ```
 
 Both `MIN_PROFIT_PCT_OF_COLLATERAL` and `TP_OVERHEAD_FLOOR_PCT` are in **% of

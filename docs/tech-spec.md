@@ -20,7 +20,7 @@
 | A6 | **Conflict check расширен:** проверяет и `positions` (status='open') И `orders` (status IN ('pending','open'), order_type='entry') | Unfilled limit ордер не создаёт `positions` строку — старый check пропускал дубли |
 | A7 | **Telethon real-time event listener** как primary; polling каждые 60s как fallback | 60s polling опаздывает на крипто-сигналах до 59 секунд |
 | A8 | **`MAX_POSITION_SIZE_USD`** добавлен в конфиг — абсолютный кап на notional независимо от % | Без капа рост аккаунта автоматически увеличивает размер позиций |
-| A9 | **SSE price staleness guard** в `tp_breakeven_watcher`: при cache age >30s fallback на REST | Зависший SSE → цена в cache стухла → breakeven trigger не срабатывает |
+| A9 | **SSE-driven breakeven** (заменяет 2s-poll из v1.5 draft): `marketPrice` фрейм → `evaluate_breakeven_trigger` → `asyncio.create_task(move_sl_to_breakeven)`. 10-секундный supervisor только держит heartbeat, реконсайлит in-memory `trigger_index` с БД и при stale SSE батч-квотит REST. | Снижает latency BE с ~1с до <300мс; обнуляет REST-нагрузку при здоровом SSE. |
 | A10 | **Watcher heartbeat check** в `sl_safety_check` | Завис asyncio task → молчание, нет алертов |
 | A11 | **`clientOrderId` pre-insert** для Aster batch до отправки запроса | Timeout на batch → нет данных в DB → reconciler не может найти ордер |
 | A12 | **`signals.prompt_version`** колонка + `SIGNAL_PARSER_PROMPT_VERSION` константа | Версионирование промпта для отладки регрессий качества парсинга |
@@ -127,7 +127,7 @@ A console-based automated trading bot that:
 | `post_fill_placer` | event-driven | Handles SSE fill events: compute TP → place TP + SL orders |
 | `sse_listener` | event-driven | SSE `/exchange/updates` → DB merge, emit lifecycle events, update price cache |
 | `reconciler` | 60s | REST sync, TTL cancellation, catch missed fills |
-| `tp_breakeven_watcher` | event-driven (2s poll) | Monitors price cache; triggers `move_sl_to_breakeven()` |
+| `breakeven_supervisor` | 10s loop | Heartbeat + reconcile `trigger_index` ↔ DB + REST rescue for stale-SSE symbols. Actual BE trigger detection is SSE-driven in `sse_listener` (`evaluate_breakeven_trigger`). |
 | `console_streamer` | event-driven | Console output |
 
 ---
@@ -595,43 +595,88 @@ async def on_entry_filled(order_fill_event):
 
 (Identical to v1.4 §8.7.1–8.7.4, with updated §8.7.5 below.)
 
-#### 8.8.5. `tp_breakeven_watcher` *(updated — staleness guard)*
+#### 8.8.5. Event-driven breakeven *(SSE-driven, replaces v1.5 2s poll)*
+
+Breakeven detection lives in two layers: a hot path fired from the SSE
+listener on every `marketPrice` frame, and a 10-second supervisor that
+handles housekeeping. There is no polling loop on the trade-active hot path.
+
+**Hot path — `evaluate_breakeven_trigger`** (called from
+`sse_listener.on_market_price_frame`):
 
 ```python
-async def tp_breakeven_watcher():
-    last_tick = time.time()
-    while True:
-        last_tick = time.time()  # heartbeat for sl_safety_check
-        positions = await db.get_open_positions_pending_be()
+@dataclass
+class _BreakevenTrigger:
+    position_id: int
+    exchange: str       # lowercased
+    symbol: str         # uppercased
+    side: str
+    entry_price: Decimal
+    leverage: int
+    trigger_pct: Decimal           # margin_pct / leverage / 100
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    fired: bool = False
 
-        for pos in positions:
-            cache_age = time.time() - price_cache_updated_at.get((pos.exchange, pos.symbol), 0)
+# (exchange, symbol) -> [_BreakevenTrigger, ...]
+trigger_index: dict[tuple[str, str], list[_BreakevenTrigger]] = {}
 
-            if cache_age > settings.SSE_PRICE_STALENESS_THRESHOLD_SEC:
-                # SSE stale — fallback to REST quote
-                try:
-                    cur_price = await vooi.get_current_price(pos.symbol, pos.exchange)
-                except Exception:
-                    continue  # skip this position this tick
-            else:
-                cur_price = price_cache.get((pos.exchange, pos.symbol))
-                if cur_price is None:
-                    continue
+async def evaluate_breakeven_trigger(exchange, symbol, price):
+    triggers = trigger_index.get((exchange.lower(), symbol.upper())) or []
+    for trigger in list(triggers):
+        if trigger.fired:
+            continue
+        if trigger.side == 'buy':
+            crossed = price >= trigger.entry_price * (1 + trigger.trigger_pct)
+        else:
+            crossed = price <= trigger.entry_price * (1 - trigger.trigger_pct)
+        if not crossed or trigger.lock.locked():
+            continue
+        # Fire-and-forget so the SSE handler is not blocked by HTTP latency.
+        asyncio.create_task(_fire_breakeven_safely(trigger, price))
 
-            E = pos.entry_price
-            # BREAKEVEN_TRIGGER_PCT is % of margin; ÷ leverage → % of price.
-            trigger_pct = Decimal(settings.BREAKEVEN_TRIGGER_PCT) / 100 / pos.leverage
-
-            if pos.side == 'buy' and cur_price >= E * (1 + trigger_pct):
-                await move_sl_to_breakeven(pos)
-            elif pos.side == 'sell' and cur_price <= E * (1 - trigger_pct):
-                await move_sl_to_breakeven(pos)
-
-        await asyncio.sleep(2)
-
-# Accessible by sl_safety_check:
-tp_breakeven_watcher_last_tick: float = 0.0
+async def _fire_breakeven_safely(trigger, observed_price):
+    async with trigger.lock:
+        if trigger.fired:
+            return
+        await move_sl_to_breakeven(trigger.position_id)
+        # Verify outcome in DB — only mark fired if sl_moved_to_be_at is set.
+        # Partial failures leave fired=False so the next price tick retries.
+        ...
 ```
+
+**Supervisor — `tp_breakeven_supervisor_task`** (every 10s):
+
+```python
+tp_breakeven_watcher_last_tick: float = 0.0  # read by sl_safety_check
+
+async def tp_breakeven_supervisor_task():
+    await _seed_price_cache_from_db()
+    await _seed_trigger_index_from_db()
+    while True:
+        tp_breakeven_watcher_last_tick = time.time()
+        await _reconcile_trigger_index()           # add missing, drop closed
+        await _rescue_stale_sse_positions()        # batch REST quotes if SSE silent
+        await asyncio.sleep(10)
+```
+
+**Registration lifecycle:**
+
+1. `post_fill_placer` calls `register_breakeven_trigger(position)` once SL+TP
+   are placed and `position.status='open'`. Minimises first-tick latency.
+2. `sse_listener._handle_position_close` calls
+   `unregister_breakeven_trigger(position_id)` when the position closes.
+3. The 10s supervisor reconciles the index against the DB, so any missed
+   register/unregister self-heals within one cycle.
+
+**Idempotency under tick storms:** the per-trigger `asyncio.Lock` plus the
+`fired` flag guarantee at most one in-flight BE move per position. New
+ticks arriving mid-flight are filtered by `trigger.lock.locked()`.
+
+**Stale-SSE rescue path:** `_rescue_stale_sse_positions` is the only place
+breakeven logic ever hits REST `/exchange/quotes`. It runs only when
+`time.time() - price_cache_updated_at[(exchange, symbol)] > SSE_PRICE_STALENESS_THRESHOLD_SEC`
+and only for symbols that have an active trigger. With a healthy SSE link
+the rescue path makes zero REST calls.
 
 ---
 
@@ -655,7 +700,7 @@ For testing acceptance criterion #16 without waiting for real price movement:
 
 1. Takes an open position.
 2. Forcibly sets `price_cache[(exchange, symbol)] = entry_price × 1.03` (simulates 3% move).
-3. `tp_breakeven_watcher` detects trigger on next 2s tick and calls `move_sl_to_breakeven()`.
+3. `evaluate_breakeven_trigger` is invoked directly with the synthetic price (CLI path mirrors the SSE hot path) and calls `move_sl_to_breakeven()`.
 4. Prints `SL_BREAKEVEN` event; resets price_cache to actual market price after.
 
 **Does not place real orders** in simulation mode; uses `--dry-run` flag if you want to test the cancel-replace API calls on a real position in staging.
@@ -684,7 +729,7 @@ For testing acceptance criterion #16 without waiting for real price movement:
 | Entry order fill received but TP placement fails | Inline retry × 3. If still failing, `tp_safety_watchdog` keeps retrying every 30s (rate-limited 6/h per position). `sl_safety_check` emits `ERROR_NO_TP`. |
 | Entry order fill received but SL placement fails | Inline retry × 3. `ERROR_NAKED_POSITION` within 30s if no SL appears. `lighter_sl_watchdog` re-places on lighter (3/h). |
 | `open_pending_tp_sl` position stuck >60s | Reconciler re-triggers `on_entry_filled` once. If still stuck — emit ERROR. |
-| `tp_breakeven_watcher` heartbeat stale >30s | `sl_safety_check` emits `ERROR_WATCHER_HUNG`. Operator must inspect asyncio task. |
+| `breakeven_supervisor` heartbeat stale >30s | `sl_safety_check` emits `ERROR_WATCHER_HUNG`. Operator must inspect asyncio task. |
 
 Removed from v1.4: JWT expiry handling — API keys are perpetual.
 
@@ -778,7 +823,7 @@ Stage 6 requires `marketPrice` SSE plumbing from Stage 5.
 (New:)
 
 16. When position price crosses entry+2%, within 60 seconds: SL cancelled, new BE SL placed, `sl_moved_to_be_at` set, `SL_BREAKEVEN` event emitted.
-17. `sl_safety_check` detects naked position within 30s. `ERROR_WATCHER_HUNG` fires if `tp_breakeven_watcher` heartbeat stale >30s.
+17. `sl_safety_check` detects naked position within 30s. `ERROR_WATCHER_HUNG` fires if `breakeven_supervisor` heartbeat stale >30s.
 18. ≥80% of 16 fixture signals in `fixtures/appendix_b_signals.json` parse correctly.
 19. TP price for `close_reason='closed_tp'` positions yields realized PnL within ±0.5% of `MIN_PROFIT_PCT_OF_COLLATERAL` of original collateral.
 
@@ -815,7 +860,7 @@ signal-bot/
 │   ├── orders.py                  # pre-trade setup + entry-only order placement
 │   ├── post_fill_placer.py        # TP+SL placement after fill
 │   ├── tp_calculator.py           # compute_tp_price + compute_breakeven_sl_price
-│   ├── breakeven_watcher.py       # tp_breakeven_watcher + staleness guard
+│   ├── breakeven_watcher.py       # trigger_index + evaluate_breakeven_trigger + supervisor
 │   ├── sl_safety.py               # sl_safety_check + watcher heartbeat
 │   ├── sse_listener.py
 │   ├── reconciler.py
