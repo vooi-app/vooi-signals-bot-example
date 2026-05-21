@@ -74,7 +74,7 @@ async def _run_all_tasks() -> None:
     from bot.ingester import ingester_task
     from bot.reconciler import reconciler_task
     from bot.sse_listener import sse_listener_task
-    from bot.breakeven_watcher import tp_breakeven_watcher_task
+    from bot.breakeven_watcher import tp_breakeven_supervisor_task
     from bot.sl_safety import (
         lighter_sl_watchdog_task,
         sl_safety_check_task,
@@ -95,7 +95,7 @@ async def _run_all_tasks() -> None:
         asyncio.create_task(ingester_task(), name="ingester"),
         asyncio.create_task(sse_listener_task(), name="sse_listener"),
         asyncio.create_task(reconciler_task(), name="reconciler"),
-        asyncio.create_task(tp_breakeven_watcher_task(), name="breakeven_watcher"),
+        asyncio.create_task(tp_breakeven_supervisor_task(), name="breakeven_supervisor"),
         asyncio.create_task(sl_safety_check_task(), name="sl_safety"),
         asyncio.create_task(lighter_sl_watchdog_task(), name="lighter_sl_watchdog"),
         asyncio.create_task(tp_safety_watchdog_task(), name="tp_safety_watchdog"),

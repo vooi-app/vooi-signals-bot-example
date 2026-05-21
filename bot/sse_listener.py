@@ -238,18 +238,29 @@ async def on_position_frame(frame: dict[str, Any]) -> None:
 
 
 async def on_market_price_frame(frame: dict[str, Any]) -> None:
-    """Handle market price frame — update price cache."""
+    """Handle market price frame — update price cache and fire BE evaluator."""
     price_data = frame.get("data") or frame
 
     exchange = str(price_data.get("exchange") or "")
     symbol = str(price_data.get("asset") or price_data.get("symbol") or "")
     price = price_data.get("price") or price_data.get("markPrice") or price_data.get("indexPrice")
 
-    if exchange and symbol and price is not None:
-        key = (exchange.lower(), symbol.upper())
-        price_cache[key] = Decimal(str(price))
-        price_cache_updated_at[key] = time.monotonic()
-        log.debug("price_cache_updated", exchange=exchange, symbol=symbol, price=price)
+    if not (exchange and symbol and price is not None):
+        return
+
+    key = (exchange.lower(), symbol.upper())
+    price_decimal = Decimal(str(price))
+    price_cache[key] = price_decimal
+    price_cache_updated_at[key] = time.monotonic()
+    log.debug("price_cache_updated", exchange=exchange, symbol=symbol, price=price)
+
+    # Event-driven breakeven: feed the new price into the evaluator. Late
+    # import avoids a circular dependency at module load time.
+    try:
+        from bot.breakeven_watcher import evaluate_breakeven_trigger
+        await evaluate_breakeven_trigger(exchange, symbol, price_decimal)
+    except Exception as e:
+        log.error("breakeven_evaluate_failed", exchange=exchange, symbol=symbol, error=str(e))
 
 
 async def on_account_frame(frame: dict[str, Any]) -> None:
@@ -315,6 +326,14 @@ async def _handle_position_close(
         symbol=position.symbol,
         message=f"{position.side} {close_reason} price={close_price} pnl={realized_pnl}",
     )
+
+    # Drop any pending breakeven trigger so the SSE evaluator doesn't try to
+    # fire a BE move on a closed position. Late import avoids a cycle.
+    try:
+        from bot.breakeven_watcher import unregister_breakeven_trigger
+        unregister_breakeven_trigger(position.id)
+    except Exception as e:
+        log.debug("breakeven_unregister_failed", position_id=position.id, error=str(e))
 
     # Update DD state after close
     from bot.router import update_dd_state

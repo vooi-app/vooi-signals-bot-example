@@ -66,7 +66,8 @@ Automated crypto-futures trading bot that ingests trading signals from Telegram 
                                         │
                                         ▼
                           ┌───────────────────────────────┐
-                          │ breakeven_watcher (price loop)│  ── SSE prices
+                          │ breakeven (SSE-driven)        │  ── price ticks fire evaluator
+                          │ breakeven_supervisor (10s)    │  ── heartbeat + reconcile + rescue
                           │ reconciler (60s sync)         │  ── REST positions/orders
                           │ sl_safety_check (30s)         │  ── NAKED + NO_TP alerts
                           │ tp_safety_watchdog (30s)      │  ── retries missing TPs
@@ -81,7 +82,7 @@ Automated crypto-futures trading bot that ingests trading signals from Telegram 
 | `ingester` | `bot/ingester.py` | Telethon real-time + polling, persists messages |
 | `sse_listener` | `bot/sse_listener.py` | Subscribes to `/exchange/updates` for live prices + order events |
 | `reconciler` | `bot/reconciler.py` | Every 60s reconciles DB ↔ exchange (positions, orders, expired limits) |
-| `breakeven_watcher` | `bot/breakeven_watcher.py` | Monitors open positions, moves SL to BE on threshold |
+| `breakeven_supervisor` | `bot/breakeven_watcher.py` | 10 s loop: heartbeat, reconcile in-memory `trigger_index` with DB, REST-rescue positions whose SSE feed went stale. Trigger detection itself is event-driven from SSE — see `evaluate_breakeven_trigger`. |
 | `sl_safety_check` | `bot/sl_safety.py` | Detects positions without active SL → `ERROR_NAKED_POSITION`. Also flags missing TP → `ERROR_NO_TP` (only while SL has not been moved to breakeven). |
 | `tp_safety_watchdog` | `bot/sl_safety.py` | Re-places missing TP orders for open positions. Rate-limit: 6 attempts/hour per position. |
 | `lighter_sl_watchdog` | `bot/sl_safety.py` | Re-places SL on lighter (where the venue occasionally drops triggers). Rate-limit: 3 attempts/hour per position. |
@@ -376,7 +377,7 @@ Worked example — same trade, signal_sl=75000:
 2. **Entry fills.** `post_fill_placer` immediately submits two reduce-only trigger orders:
    - SL: either signal-provided (if `USE_SIGNAL_SL=true`) or computed `entry ± DEFAULT_SL_PCT / leverage`.
    - TP: computed per the formula above.
-3. **Breakeven move.** When unrealised profit crosses `BREAKEVEN_TRIGGER_PCT` (% of margin) in our favor, `breakeven_watcher` cancels the existing SL and places a new one at `entry × (1 ± buffer)` where `buffer ≈ 8 bps` covers exit fees. From this point the position cannot close in the red — worst case is exit at ~0.
+3. **Breakeven move.** Event-driven from SSE: every `marketPrice` frame calls `evaluate_breakeven_trigger`, which checks the in-memory `trigger_index` and, if `BREAKEVEN_TRIGGER_PCT` (% of margin) is crossed in our favor, schedules `move_sl_to_breakeven` as a separate asyncio task. The move cancels the existing SL and places a new one at `entry × (1 ± buffer)` where `buffer ≈ 8 bps` covers exit fees. From this point the position cannot close in the red — worst case is exit at ~0. A 10 s supervisor loop (`tp_breakeven_supervisor_task`) maintains the heartbeat, reconciles the trigger index with the DB, and REST-rescues positions whose SSE feed has gone stale.
 4. **SL safety watchdog** (every 30s) verifies every `open` position has an active SL on the exchange. Missing → `ERROR_NAKED_POSITION` alert. A separate `lighter_sl_watchdog` re-places SL on lighter specifically, where the exchange occasionally drops trigger orders for opaque reasons.
 5. **TP safety watchdog** (every 30s) verifies every `open` position with `sl_moved_to_be_at IS NULL` has an active TP. Missing → recompute the target via the same formula used at post-fill and re-place via the verified-trigger path. Rate-limited at 6 attempts/hour/position; final failure surfaces `ERROR_NO_TP`. This recovers from the common pattern "VOOI returned 503 during the post-fill TP POST and the bot gave up".
 
@@ -595,7 +596,7 @@ bot/
 ├── resolver.py           # Symbol normalization + decimal caches
 ├── orders.py             # place_entry_order, lookups
 ├── post_fill_placer.py   # On fill: place SL + TP (with verification)
-├── breakeven_watcher.py  # BE move loop
+├── breakeven_watcher.py  # SSE-driven BE evaluator + 10 s supervisor
 ├── sl_safety.py          # NAKED detector
 ├── sse_listener.py       # /exchange/updates subscriber
 ├── reconciler.py         # 60s DB↔exchange sync
@@ -621,7 +622,7 @@ bot/
 
 ## Known limitations
 
-- **No real-time SSE for prices via MCP-equivalent.** The bot's `breakeven_watcher` depends on the SSE price feed for sub-second reaction. If VOOI's SSE goes down for >`SSE_PRICE_STALENESS_THRESHOLD_SEC`, the watcher falls back to REST `/exchange/quotes`, which is slower and more expensive.
+- **Stale SSE rescue is REST-based.** Breakeven detection is normally driven by `marketPrice` SSE frames. If VOOI's SSE goes down for >`SSE_PRICE_STALENESS_THRESHOLD_SEC`, the 10 s supervisor batch-quotes `/exchange/quotes` for stale positions only — far gentler than the old 2 s per-position poll, but still adds REST load when the SSE link is broken.
 - **Lighter returns `clientOrderId: null`** in `/exchange/open-orders`, breaking the standard lookup path. `post_fill_placer._verify_trigger_on_exchange` works around this by matching `(asset, side, triggerPrice, size, type)`. If you see `post_fill_trigger_unverified_NAKED` in logs, this is the recovery path firing.
 - **Aster does not support bracket orders.** TP/SL must be placed as separate orders after the entry fills — never inline with the entry POST. This is handled automatically.
 - **Hyperliquid requires `0x`-prefixed 128-bit hex clientOrderIds.** See `bot/orders.py:make_client_order_id`. The breakeven watcher uses the same helper.

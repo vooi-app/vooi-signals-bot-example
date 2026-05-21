@@ -1,18 +1,25 @@
 """
-TP breakeven watcher.
-Monitors open position prices every 2s.
-When price crosses BREAKEVEN_TRIGGER_PCT favorably, moves SL to breakeven+buffer.
-Per spec §8.8, §8.8.5.
+TP breakeven — event-driven via SSE marketPrice frames.
+
+The hot path is `evaluate_breakeven_trigger`, called from sse_listener on each
+incoming price tick. A lightweight supervisor task runs every 10s to:
+  - update the heartbeat read by sl_safety_check,
+  - reconcile the in-memory trigger_index with the DB (catches positions we
+    might have missed via SSE-driven registration),
+  - rescue positions whose SSE feed has gone stale (>30s) by batch-quoting
+    REST and re-evaluating.
+
+Per spec §8.8.
 """
 import asyncio
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
 import structlog
 from sqlalchemy import and_, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.alerts import send_naked_position_alert
 from bot.config import settings
@@ -32,16 +39,184 @@ from bot.vooi_client import get_vooi_client
 
 log = structlog.get_logger(__name__)
 
-# Heartbeat timestamp — checked by sl_safety_check
-# Must be declared at module level and updated each iteration
+# -----------------------------------------------------------------------------
+# Heartbeat — read by sl_safety_check.check_watcher_heartbeat
+# -----------------------------------------------------------------------------
 tp_breakeven_watcher_last_tick: float = 0.0
 
+_SUPERVISOR_INTERVAL_SEC = 10
 
+
+# -----------------------------------------------------------------------------
+# In-memory trigger index
+#
+# Source of truth is the `positions` table. This index is a derived cache so
+# the SSE hot path doesn't have to SELECT on every price tick. The supervisor
+# reconciles it back to the DB every 10s, so a missed register/unregister is
+# self-healing within one cycle.
+# -----------------------------------------------------------------------------
+@dataclass
+class _BreakevenTrigger:
+    position_id: int
+    exchange: str      # lowercased
+    symbol: str        # uppercased
+    side: str
+    entry_price: Decimal
+    leverage: int
+    trigger_pct: Decimal  # as % of price (margin_pct / leverage / 100)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    fired: bool = False
+
+
+# (exchange, symbol) -> list[_BreakevenTrigger]
+# A list (not a single item) because the same symbol can be open on multiple
+# exchanges; in practice the bot rejects duplicates so this is usually len ≤ 1.
+trigger_index: dict[tuple[str, str], list[_BreakevenTrigger]] = {}
+
+
+def _compute_trigger_pct(leverage: int) -> Decimal:
+    """BREAKEVEN_TRIGGER_PCT is % of margin; ÷ leverage → % of price."""
+    return (
+        Decimal(str(settings.breakeven_trigger_pct))
+        / Decimal("100")
+        / Decimal(str(leverage))
+    )
+
+
+def register_breakeven_trigger(position: Position) -> None:
+    """
+    Add a position to the in-memory trigger index. Idempotent — if a trigger
+    for the same position_id already exists, it is replaced.
+    """
+    if position.status != "open":
+        return
+    if position.sl_moved_to_be_at is not None:
+        return  # BE already locked in — nothing left to trigger
+
+    key = (position.exchange.lower(), position.symbol.upper())
+    trigger = _BreakevenTrigger(
+        position_id=position.id,
+        exchange=key[0],
+        symbol=key[1],
+        side=position.side,
+        entry_price=position.entry_price,
+        leverage=position.leverage,
+        trigger_pct=_compute_trigger_pct(position.leverage),
+    )
+    triggers = trigger_index.setdefault(key, [])
+    # Replace any existing entry for this position to keep entry_price fresh.
+    triggers[:] = [t for t in triggers if t.position_id != position.id]
+    triggers.append(trigger)
+    log.debug(
+        "breakeven_trigger_registered",
+        position_id=position.id,
+        exchange=key[0],
+        symbol=key[1],
+        trigger_pct=str(trigger.trigger_pct),
+    )
+
+
+def unregister_breakeven_trigger(position_id: int) -> None:
+    """Remove all entries for a position. Safe to call multiple times."""
+    removed = False
+    for key in list(trigger_index.keys()):
+        before = len(trigger_index[key])
+        trigger_index[key] = [t for t in trigger_index[key] if t.position_id != position_id]
+        if not trigger_index[key]:
+            del trigger_index[key]
+        if before != len(trigger_index.get(key, [])):
+            removed = True
+    if removed:
+        log.debug("breakeven_trigger_unregistered", position_id=position_id)
+
+
+async def evaluate_breakeven_trigger(
+    exchange: str, symbol: str, price: Decimal
+) -> None:
+    """
+    Hot path. Called from sse_listener.on_market_price_frame on every tick.
+
+    Looks up the (exchange, symbol) bucket in the trigger index and, for each
+    un-fired trigger whose threshold is crossed, schedules a fire-and-forget
+    breakeven move. Per-trigger asyncio.Lock + fired flag guarantee a single
+    BE move per position even under a torrent of price ticks.
+
+    Does not block on HTTP — heavy work runs in a separate task so subsequent
+    marketPrice frames keep flowing.
+    """
+    key = (exchange.lower(), symbol.upper())
+    triggers = trigger_index.get(key)
+    if not triggers:
+        return
+
+    for trigger in list(triggers):
+        if trigger.fired:
+            continue
+        if trigger.side == "buy":
+            crossed = price >= trigger.entry_price * (Decimal("1") + trigger.trigger_pct)
+        elif trigger.side == "sell":
+            crossed = price <= trigger.entry_price * (Decimal("1") - trigger.trigger_pct)
+        else:
+            continue
+        if not crossed:
+            continue
+        if trigger.lock.locked():
+            continue  # already firing; another task will handle it
+        asyncio.create_task(_fire_breakeven_safely(trigger, price))
+
+
+async def _fire_breakeven_safely(trigger: _BreakevenTrigger, observed_price: Decimal) -> None:
+    """Acquire the trigger lock and run the BE move. Idempotent on retry."""
+    async with trigger.lock:
+        if trigger.fired:
+            return
+
+        log.info(
+            "breakeven_trigger_detected",
+            position_id=trigger.position_id,
+            exchange=trigger.exchange,
+            symbol=trigger.symbol,
+            entry=str(trigger.entry_price),
+            current=str(observed_price),
+            trigger_pct=str(trigger.trigger_pct),
+        )
+
+        try:
+            await move_sl_to_breakeven(trigger.position_id)
+        except Exception as e:
+            log.error(
+                "breakeven_fire_error",
+                position_id=trigger.position_id,
+                error=str(e),
+            )
+            return  # leave fired=False → retry on next price
+
+        # Verify the move actually persisted. move_sl_to_breakeven swallows
+        # internal failures (cancel failed, NAKED, etc.) and returns silently;
+        # we only mark fired once the DB shows sl_moved_to_be_at is set.
+        async with session_scope() as session:
+            result = await session.execute(
+                select(Position).where(Position.id == trigger.position_id)
+            )
+            pos = result.scalar_one_or_none()
+            if pos is not None and pos.sl_moved_to_be_at is not None:
+                trigger.fired = True
+                unregister_breakeven_trigger(trigger.position_id)
+            else:
+                log.warning(
+                    "breakeven_move_did_not_persist",
+                    position_id=trigger.position_id,
+                )
+
+
+# -----------------------------------------------------------------------------
+# Startup seeding
+# -----------------------------------------------------------------------------
 async def _seed_price_cache_from_db() -> None:
     """
-    BUG-07: On startup, seed price_cache with entry_price for all open positions.
-    Prevents breakeven watcher from silently skipping positions that have no SSE
-    price yet (e.g. after bot restart). Entry price is the last known price.
+    On startup, seed price_cache with entry_price for all open positions.
+    Prevents breakeven evaluation from silently skipping positions before
+    the first SSE tick arrives (e.g. low-liquidity symbols).
     """
     async with session_scope() as session:
         result = await session.execute(
@@ -53,150 +228,165 @@ async def _seed_price_cache_from_db() -> None:
         key = (pos.exchange.lower(), pos.symbol.upper())
         if key not in price_cache:
             price_cache[key] = pos.entry_price
-            # Don't set price_cache_updated_at — age will be > staleness threshold,
-            # which triggers REST fallback on first check. That's correct.
+            # Intentionally don't set price_cache_updated_at — age > staleness
+            # threshold so the rescue path will REST-quote on first cycle.
 
     if positions:
         log.info("price_cache_seeded_from_db", count=len(positions))
 
 
-async def tp_breakeven_watcher_task() -> None:
+async def _seed_trigger_index_from_db() -> None:
+    """Populate trigger_index with all open positions whose BE hasn't fired."""
+    async with session_scope() as session:
+        result = await session.execute(
+            select(Position).where(
+                and_(
+                    Position.status == "open",
+                    Position.sl_moved_to_be_at.is_(None),
+                )
+            )
+        )
+        positions = result.scalars().all()
+
+    for pos in positions:
+        register_breakeven_trigger(pos)
+
+    log.info(
+        "breakeven_trigger_index_seeded",
+        count=sum(len(v) for v in trigger_index.values()),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Supervisor — runs every 10s
+#   1. heartbeat
+#   2. reconcile trigger_index with DB (add missing / drop closed)
+#   3. rescue positions whose SSE price feed is stale
+# -----------------------------------------------------------------------------
+async def tp_breakeven_supervisor_task() -> None:
     """
-    Main breakeven watcher loop.
-    Checks all open positions every 2s for breakeven trigger.
-    Updates tp_breakeven_watcher_last_tick heartbeat each iteration.
+    Replaces the v1.5 2-second polling loop. The hot path is now SSE-driven
+    (see `evaluate_breakeven_trigger`). This task only does maintenance.
     """
     global tp_breakeven_watcher_last_tick
 
     await _seed_price_cache_from_db()
+    await _seed_trigger_index_from_db()
 
     while True:
         try:
-            tp_breakeven_watcher_last_tick = time.time()  # heartbeat
-
-            async with session_scope() as session:
-                # Get open positions that haven't hit breakeven yet
-                result = await session.execute(
-                    select(Position).where(
-                        and_(
-                            Position.status == "open",
-                            Position.sl_moved_to_be_at.is_(None),
-                        )
-                    )
-                )
-                positions = result.scalars().all()
-
-            for pos in positions:
-                try:
-                    await _check_position_breakeven(pos)
-                except Exception as e:
-                    log.error(
-                        "breakeven_check_error",
-                        position_id=pos.id,
-                        error=str(e),
-                    )
-
+            tp_breakeven_watcher_last_tick = time.time()
+            await _reconcile_trigger_index()
+            await _rescue_stale_sse_positions()
         except asyncio.CancelledError:
-            log.info("breakeven_watcher_cancelled")
+            log.info("breakeven_supervisor_cancelled")
             break
         except Exception as e:
-            log.error("breakeven_watcher_loop_error", error=str(e))
+            log.error("breakeven_supervisor_error", error=str(e))
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(_SUPERVISOR_INTERVAL_SEC)
 
 
-async def _check_position_breakeven(pos: Position) -> None:
-    """Check if a single position should trigger breakeven SL move."""
-    key = (pos.exchange.lower(), pos.symbol.upper())
-    cache_age = time.time() - price_cache_updated_at.get(key, 0)
-
-    # Get current price
-    cur_price: Optional[Decimal] = None
-
-    if cache_age > settings.sse_price_staleness_threshold_sec:
-        # SSE stale — fallback to REST
-        log.debug(
-            "price_cache_stale_fallback",
-            exchange=pos.exchange,
-            symbol=pos.symbol,
-            cache_age=cache_age,
+async def _reconcile_trigger_index() -> None:
+    """Sync in-memory index with DB. Self-healing for missed register calls."""
+    async with session_scope() as session:
+        result = await session.execute(
+            select(Position).where(
+                and_(
+                    Position.status == "open",
+                    Position.sl_moved_to_be_at.is_(None),
+                )
+            )
         )
-        client = get_vooi_client()
+        positions = list(result.scalars())
+
+    eligible_ids = {p.id for p in positions}
+
+    # Drop entries for positions that are no longer eligible (closed or BE-fired).
+    for key in list(trigger_index.keys()):
+        trigger_index[key] = [t for t in trigger_index[key] if t.position_id in eligible_ids]
+        if not trigger_index[key]:
+            del trigger_index[key]
+
+    # Add entries for any positions missing from the index.
+    indexed = {t.position_id for ts in trigger_index.values() for t in ts}
+    for pos in positions:
+        if pos.id not in indexed:
+            register_breakeven_trigger(pos)
+
+
+async def _rescue_stale_sse_positions() -> None:
+    """
+    For positions whose SSE marketPrice hasn't ticked within the staleness
+    window, batch-fetch REST quotes and feed them back into the evaluator.
+    This is the only place that hits /exchange/quotes from breakeven logic;
+    with healthy SSE it makes zero requests.
+    """
+    if not trigger_index:
+        return
+
+    cutoff = time.time() - settings.sse_price_staleness_threshold_sec
+    stale_keys: set[tuple[str, str]] = set()
+
+    for key, triggers in trigger_index.items():
+        if not triggers:
+            continue
+        last = price_cache_updated_at.get(key, 0)
+        if last < cutoff:
+            stale_keys.add(key)
+
+    if not stale_keys:
+        return
+
+    client = get_vooi_client()
+    for exchange, symbol in stale_keys:
         try:
-            raw_price = await client.get_current_price(pos.symbol, pos.exchange)
-            cur_price = Decimal(str(raw_price))
-            # Update the cache with REST-fetched price
-            price_cache[key] = cur_price
-            price_cache_updated_at[key] = time.time()
+            raw_price = await client.get_current_price(symbol, exchange)
+            price = Decimal(str(raw_price))
         except Exception as e:
-            log.warning(
-                "rest_price_fetch_failed",
-                exchange=pos.exchange,
-                symbol=pos.symbol,
+            log.debug(
+                "breakeven_rescue_quote_failed",
+                exchange=exchange,
+                symbol=symbol,
                 error=str(e),
             )
-            return  # Skip this position this tick
-    else:
-        cur_price = price_cache.get(key)
-        if cur_price is None:
-            return
-
-    E = pos.entry_price
-    # BREAKEVEN_TRIGGER_PCT is denominated in % of margin (collateral);
-    # divide by leverage to convert to % of price.
-    trigger_pct = (
-        Decimal(str(settings.breakeven_trigger_pct))
-        / Decimal("100")
-        / Decimal(str(pos.leverage))
-    )
-
-    should_trigger = False
-    if pos.side == "buy" and cur_price >= E * (Decimal("1") + trigger_pct):
-        should_trigger = True
-    elif pos.side == "sell" and cur_price <= E * (Decimal("1") - trigger_pct):
-        should_trigger = True
-
-    if should_trigger:
-        log.info(
-            "breakeven_trigger_detected",
-            position_id=pos.id,
-            symbol=pos.symbol,
-            entry=str(E),
-            current=str(cur_price),
-            trigger_pct=str(trigger_pct),
-        )
-        await move_sl_to_breakeven(pos)
+            continue
+        price_cache[(exchange, symbol)] = price
+        price_cache_updated_at[(exchange, symbol)] = time.time()
+        await evaluate_breakeven_trigger(exchange, symbol, price)
 
 
-async def move_sl_to_breakeven(position: Position) -> None:
+# -----------------------------------------------------------------------------
+# Breakeven move
+# -----------------------------------------------------------------------------
+async def move_sl_to_breakeven(position_id: int) -> None:
     """
-    Move SL to breakeven+buffer.
+    Cancel the live SL and place a new one at entry + safety buffer.
+
     Steps per spec §8.8:
-    1. Idempotency guard: sl_moved_to_be_at IS NOT NULL → return
-    2. Compute breakeven SL price
-    3. Cancel existing SL order
-    4. Place new SL (reduce-only)
-    5. Handle race (404 on cancel → position already closed)
-    6. If new SL fails after retry → send ERROR_NAKED_POSITION alert
-    7. Update position (sl_order_id, sl_price_current, sl_moved_to_be_at)
-    8. Emit SL_BREAKEVEN
+    1. Idempotency guard: sl_moved_to_be_at IS NOT NULL → return.
+    2. Compute breakeven SL price.
+    3. Cancel existing SL order (abort if cancel cannot be confirmed).
+    4. Place new SL (reduce-only) via the verified-trigger helper.
+    5. On race (404 on cancel) → position already closed.
+    6. If new SL placement fails → ERROR_NAKED_POSITION alert; do NOT set
+       sl_moved_to_be_at, so the SSE evaluator will retry on the next price.
+    7. On success, update position (sl_order_id, sl_price_current,
+       sl_moved_to_be_at) and emit SL_BREAKEVEN.
     """
     async with session_scope() as session:
-        # Reload position with fresh data
         result = await session.execute(
-            select(Position).where(Position.id == position.id)
+            select(Position).where(Position.id == position_id)
         )
         pos = result.scalar_one_or_none()
 
         if pos is None:
             return
 
-        # Idempotency guard
         if pos.sl_moved_to_be_at is not None:
             log.debug("breakeven_already_moved", position_id=pos.id)
             return
 
-        # Compute breakeven SL price
         from bot.config import settings as cfg
         exit_taker_bps = cfg.get_fee_fallback_bps(pos.exchange)
         be_price = compute_breakeven_sl_price(
@@ -213,10 +403,8 @@ async def move_sl_to_breakeven(position: Position) -> None:
 
         client = get_vooi_client()
 
-        # Cancel existing SL order. Per Swagger, DELETE /exchange/orders takes
-        # {exchange, asset, orderId} and returns {status: "ok"} on success.
-        # If we can't confirm success, we MUST abort instead of leaving two
-        # SL orders on the book (the live one still at the original trigger).
+        # Cancel existing SL order. We must confirm cancel before placing a
+        # new SL — two SLs on the book would double-close on the first hit.
         if pos.sl_order_id:
             sl_order_result = await session.execute(
                 select(Order).where(Order.id == pos.sl_order_id)
@@ -236,7 +424,6 @@ async def move_sl_to_breakeven(position: Position) -> None:
                 except Exception as e:
                     error_str = str(e).lower()
                     if "404" in error_str or "not found" in error_str:
-                        # Position already closed — race condition
                         log.warning(
                             "breakeven_cancel_404_position_closed",
                             position_id=pos.id,
@@ -249,14 +436,12 @@ async def move_sl_to_breakeven(position: Position) -> None:
                         vooi_order_id=sl_order.vooi_order_id,
                         error=str(e),
                     )
-                    # ABORT: do not place a new SL when we can't confirm the
-                    # old one was cancelled — we would end up with two SLs.
                     return
 
-                # Cancel API returned 2xx. Confirm the response shape is success.
                 cancel_ok = (
                     isinstance(cancel_response, dict)
-                    and str(cancel_response.get("status", "")).lower() in ("ok", "success", "cancelled", "canceled")
+                    and str(cancel_response.get("status", "")).lower()
+                    in ("ok", "success", "cancelled", "canceled")
                 )
                 if not cancel_ok:
                     log.error(
@@ -277,9 +462,7 @@ async def move_sl_to_breakeven(position: Position) -> None:
                     vooi_order_id=sl_order.vooi_order_id,
                 )
 
-        # Place new breakeven SL
-        # Hyperliquid rejects non-hex clientOrderIds; delegate format choice
-        # to make_client_order_id (issues 0x+32hex for HL, sigbot-... for others).
+        # Place new breakeven SL via the verified helper.
         be_sl_client_oid = make_client_order_id(
             pos.signal_id or 0, pos.exchange, suffix="besl"
         )
@@ -298,8 +481,6 @@ async def move_sl_to_breakeven(position: Position) -> None:
         session.add(new_sl_order)
         await session.flush()
 
-        # Place + verify via the shared helper (covers lighter clientOrderId=null
-        # silent-NAKED and httpx-hang via internal asyncio.wait_for timeout).
         sl_placed = await place_trigger_with_verification(
             client=client,
             position=pos,
@@ -323,15 +504,12 @@ async def move_sl_to_breakeven(position: Position) -> None:
                 exchange=pos.exchange,
                 symbol=pos.symbol,
                 message=(
-                    f"Breakeven SL placement failed after 3 attempts. "
-                    f"Position {pos.id} {pos.symbol} naked!"
+                    f"Breakeven move failed for position {pos.id} "
+                    f"{pos.symbol}: new SL not verified on exchange."
                 ),
             )
             return
 
-        await session.flush()
-
-        # Update position
         pos.sl_order_id = new_sl_order.id
         pos.sl_price_current = be_price_rounded
         pos.sl_moved_to_be_at = datetime.now(timezone.utc)
@@ -361,12 +539,11 @@ async def move_sl_to_breakeven(position: Position) -> None:
 
 async def simulate_breakeven(position_id: int, dry_run: bool = True) -> None:
     """
-    Simulate breakeven trigger for testing.
-    Per spec §10, §16:
-    1. Get open position
-    2. Forcibly set price_cache to entry_price × 1.03
-    3. Wait for watcher to trigger (next 2s tick)
-    4. Restore actual price after
+    Simulate breakeven trigger for testing (CLI: `bot simulate-breakeven`).
+    1. Look up position.
+    2. Compute the price that would cross the threshold (3% favorable move).
+    3. If --no-dry-run: inject into price_cache and call evaluate directly,
+       which fires the BE move via the standard path.
     """
     async with session_scope() as session:
         result = await session.execute(
@@ -383,10 +560,6 @@ async def simulate_breakeven(position_id: int, dry_run: bool = True) -> None:
         log.error("simulate_breakeven_position_not_found", position_id=position_id)
         raise ValueError(f"Position {position_id} not found or not open")
 
-    key = (pos.exchange.lower(), pos.symbol.upper())
-    original_price = price_cache.get(key)
-
-    # Simulate 3% favorable move
     if pos.side == "buy":
         simulated_price = pos.entry_price * Decimal("1.03")
     else:
@@ -399,21 +572,26 @@ async def simulate_breakeven(position_id: int, dry_run: bool = True) -> None:
         dry_run=dry_run,
     )
 
-    if not dry_run:
-        price_cache[key] = simulated_price
-        price_cache_updated_at[key] = time.time()
-
-        # Wait for watcher to detect and trigger
-        await asyncio.sleep(3)
-
-        # Restore original price
-        if original_price is not None:
-            price_cache[key] = original_price
-        else:
-            price_cache.pop(key, None)
-    else:
+    if dry_run:
         log.info(
             "simulate_breakeven_dry_run",
             position_id=position_id,
             would_set_price=str(simulated_price),
         )
+        return
+
+    key = (pos.exchange.lower(), pos.symbol.upper())
+    original_price = price_cache.get(key)
+    price_cache[key] = simulated_price
+    price_cache_updated_at[key] = time.time()
+
+    # Re-evaluate immediately — synchronous path back into the same logic
+    # that the SSE handler would use.
+    await evaluate_breakeven_trigger(pos.exchange, pos.symbol, simulated_price)
+
+    # Restore so subsequent SSE frames are not biased by the synthetic value.
+    await asyncio.sleep(1)
+    if original_price is not None:
+        price_cache[key] = original_price
+    else:
+        price_cache.pop(key, None)

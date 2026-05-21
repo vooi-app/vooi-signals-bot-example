@@ -40,14 +40,17 @@ ingester → parser → router → place_entry  ──(SSE order frame, status=f
                                                                                  ▼
                                                                        places SL + TP triggers
                                                                                  │
-                                       breakeven_watcher (2s)  ◀──── price ────  sse_listener
-                                       sl_safety_check       (30s)
-                                       tp_safety_watchdog    (30s)   re-places missing TPs
-                                       lighter_sl_watchdog   (30s)   re-places dropped SLs
-                                       reconciler            (60s)   DB ↔ exchange diff
+                                       sse_listener.on_market_price_frame
+                                            └─▶ evaluate_breakeven_trigger  (in-memory index)
+                                                     └─▶ asyncio.create_task → move_sl_to_breakeven
+                                       breakeven_supervisor (10s) — heartbeat + reconcile + stale-SSE rescue
+                                       sl_safety_check      (30s)
+                                       tp_safety_watchdog   (30s)   re-places missing TPs
+                                       lighter_sl_watchdog  (30s)   re-places dropped SLs
+                                       reconciler           (60s)   DB ↔ exchange diff
 ```
 
-Tasks are registered in `bot/cli.py:_run_all_tasks`. Each tick of `breakeven_watcher` updates `tp_breakeven_watcher_last_tick`; `sl_safety_check` reads that timestamp and fires `ERROR_WATCHER_HUNG` if it goes stale (>30s).
+Tasks are registered in `bot/cli.py:_run_all_tasks`. Breakeven detection is **SSE-driven, not polled**: every `marketPrice` frame triggers `evaluate_breakeven_trigger`, which looks up the in-memory `trigger_index` (keyed by `(exchange, symbol)`) and schedules a BE move via `asyncio.create_task` if the threshold is crossed. Per-trigger `asyncio.Lock` + `fired` flag guarantee idempotency under torrents of ticks. The supervisor's only jobs are (a) update `tp_breakeven_watcher_last_tick` so `sl_safety_check` doesn't flag `ERROR_WATCHER_HUNG`, (b) reconcile `trigger_index` against the DB every 10s (self-heals missed register/unregister calls), and (c) batch-quote REST for positions whose SSE feed has gone stale — the only place breakeven logic ever hits REST.
 
 ### The signal funnel — what filters out what
 

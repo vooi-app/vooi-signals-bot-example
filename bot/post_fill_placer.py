@@ -311,6 +311,19 @@ async def _place_tp_sl(entry_order_id: int, avg_entry_price: Optional[Decimal]) 
         position.last_synced_at = now
         await session.flush()
 
+        # Register with the SSE-driven breakeven evaluator. The supervisor
+        # reconciles every 10s, so a missed register here is self-healing,
+        # but registering inline minimises trigger latency to the next tick.
+        try:
+            from bot.breakeven_watcher import register_breakeven_trigger
+            register_breakeven_trigger(position)
+        except Exception as e:
+            log.warning(
+                "breakeven_register_failed",
+                position_id=position.id,
+                error=str(e),
+            )
+
         await emit_event(
             "POST_FILL_TP_SL_PLACED",
             position_id=position.id,
