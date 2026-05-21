@@ -358,6 +358,24 @@ async def _place_tp_sl(entry_order_id: int, avg_entry_price: Optional[Decimal]) 
                 position.id, position.symbol, position.exchange
             )
 
+        if not tp_placed:
+            log.error(
+                "post_fill_tp_failed",
+                position_id=position.id,
+                symbol=position.symbol,
+            )
+            await emit_event(
+                "ERROR_NO_TP",
+                level="ERROR",
+                position_id=position.id,
+                exchange=position.exchange,
+                symbol=position.symbol,
+                message=(
+                    f"Post-fill TP placement failed for position {position.id} "
+                    f"{position.symbol}. tp_safety_watchdog will retry every 30s."
+                ),
+            )
+
 
 # Trigger placement + verification moved to bot.orders.place_trigger_with_verification
 # (shared with breakeven_watcher / lighter_sl_watchdog).

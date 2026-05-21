@@ -130,11 +130,10 @@ async def check_naked_positions(session: AsyncSession) -> None:
             await send_naked_position_alert(pos.id, pos.symbol, pos.exchange)
 
         # ---- TP ----
-        # SL after a breakeven move is allowed to "be" the TP (locks profit),
-        # so once sl_moved_to_be_at is set we don't insist on a separate TP.
-        if pos.sl_moved_to_be_at is not None:
-            continue
-
+        # Every open position needs a TP, *including* after the SL has been
+        # moved to breakeven. BE-SL only protects the downside; without TP
+        # the position has no programmed profit-take and must be closed by
+        # hand. tp_safety_watchdog re-places when missing.
         has_active_tp = False
         if pos.tp_order_id:
             tp_result = await session.execute(
@@ -453,11 +452,10 @@ async def tp_safety_watchdog_run() -> None:
         open_positions = list(result.scalars())
 
         for pos in open_positions:
-            # Skip positions whose SL has already locked in profit (BE move
-            # ran) — TP is redundant once SL is at/above breakeven.
-            if pos.sl_moved_to_be_at is not None:
-                continue
-
+            # Note: we deliberately do NOT skip positions where BE-SL has
+            # already fired. BE-SL caps the loss at ~0 but leaves no upside
+            # ceiling — the bot would sit until manual close. TP must be
+            # re-placed regardless of BE status.
             tp_active = False
             if pos.tp_order_id:
                 tp_result = await session.execute(

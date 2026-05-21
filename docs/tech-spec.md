@@ -746,14 +746,14 @@ async def sl_safety_check():
             if not active_sl:
                 alert('ERROR_NAKED_POSITION', position=pos)
 
-            # 2. Missing TP check (only while SL has not been moved to BE —
-            # once SL ≥ breakeven, the TP is no longer required for safety).
-            if pos.sl_moved_to_be_at is None:
-                active_tp = db.orders.filter(
-                    id=pos.tp_order_id, status__in=('pending', 'open')
-                ).exists()
-                if not active_tp:
-                    alert('ERROR_NO_TP', position=pos)
+            # 2. Missing TP check — required for EVERY open position, including
+            # after BE-SL has fired. BE-SL only caps the loss at ~0; without TP
+            # the position has no programmed profit-take and runs unbounded.
+            active_tp = db.orders.filter(
+                id=pos.tp_order_id, status__in=('pending', 'open')
+            ).exists()
+            if not active_tp:
+                alert('ERROR_NO_TP', position=pos)
 
         # 3. Watcher heartbeat check
         watcher_age = time.time() - tp_breakeven_watcher_last_tick
@@ -766,8 +766,9 @@ async def sl_safety_check():
 **`tp_safety_watchdog_task` (every 30s):** scans open positions for a missing
 TP order and re-places via the same verified-trigger helper used by post-fill.
 Rate-limit: `_TP_WATCHDOG_MAX_ATTEMPTS_PER_HOUR = 6` per position. Beyond that,
-emits a final `ERROR_NO_TP` and stops retrying. Skips positions where
-`sl_moved_to_be_at IS NOT NULL` (BE-SL already locks in profit).
+emits a final `ERROR_NO_TP` and stops retrying. Runs for **every** open
+position regardless of `sl_moved_to_be_at` — BE-SL is downside-only, the bot
+must still place its programmed profit-target.
 
 ---
 

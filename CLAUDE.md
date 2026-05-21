@@ -102,7 +102,7 @@ TP_short = entry × (1 − total)
 
 ### TP retry on transient VOOI failures
 
-`tp_safety_watchdog_task` (new) handles the case where VOOI returns 503 during the post-fill TP POST and the inline 3-retry exhausts. Every 30s it scans `status='open'` positions with no live TP and re-places. Skipped if `sl_moved_to_be_at IS NOT NULL` (BE-SL already locks in profit). Rate-limit: 6 attempts/hour/position; on exhaustion → `ERROR_NO_TP`.
+`tp_safety_watchdog_task` (new) handles the case where VOOI returns 503 during the post-fill TP POST and the inline 3-retry exhausts. Every 30s it scans `status='open'` positions with no live TP and re-places. It **does not** skip positions where BE-SL has already fired — BE-SL only protects the downside, but without TP the position has no programmed profit-take and would have to be closed by hand. Rate-limit: 6 attempts/hour/position; on exhaustion → `ERROR_NO_TP`.
 
 The companion `sl_safety_check` now emits `ERROR_NO_TP` as well as `ERROR_NAKED_POSITION` so missing TPs surface in alerts.
 
