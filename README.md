@@ -68,7 +68,9 @@ Automated crypto-futures trading bot that ingests trading signals from Telegram 
                           ┌───────────────────────────────┐
                           │ breakeven_watcher (price loop)│  ── SSE prices
                           │ reconciler (60s sync)         │  ── REST positions/orders
-                          │ sl_safety_check (30s)         │  ── NAKED alert
+                          │ sl_safety_check (30s)         │  ── NAKED + NO_TP alerts
+                          │ tp_safety_watchdog (30s)      │  ── retries missing TPs
+                          │ lighter_sl_watchdog (30s)     │  ── re-places dropped SLs
                           └───────────────────────────────┘
 ```
 
@@ -80,7 +82,9 @@ Automated crypto-futures trading bot that ingests trading signals from Telegram 
 | `sse_listener` | `bot/sse_listener.py` | Subscribes to `/exchange/updates` for live prices + order events |
 | `reconciler` | `bot/reconciler.py` | Every 60s reconciles DB ↔ exchange (positions, orders, expired limits) |
 | `breakeven_watcher` | `bot/breakeven_watcher.py` | Monitors open positions, moves SL to BE on threshold |
-| `sl_safety_check` | `bot/sl_safety.py` | Detects positions without active SL → `ERROR_NAKED_POSITION` |
+| `sl_safety_check` | `bot/sl_safety.py` | Detects positions without active SL → `ERROR_NAKED_POSITION`. Also flags missing TP → `ERROR_NO_TP` (only while SL has not been moved to breakeven). |
+| `tp_safety_watchdog` | `bot/sl_safety.py` | Re-places missing TP orders for open positions. Rate-limit: 6 attempts/hour per position. |
+| `lighter_sl_watchdog` | `bot/sl_safety.py` | Re-places SL on lighter (where the venue occasionally drops triggers). Rate-limit: 3 attempts/hour per position. |
 
 `startup_cleanup` (`bot/startup_cleanup.py`) runs once at boot to cancel dangling orphan orders and mark phantom positions.
 
@@ -149,7 +153,6 @@ Edit `.env` and fill in:
 |---|---|
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | <https://my.telegram.org/apps> |
 | `VOOI_API_KEY` | VOOI team |
-| `VOOI_BROKER_ID_HYPERLIQUID` / `_LIGHTER` / `_ASTER` | VOOI team |
 | `LLM_API_KEY` | OpenAI / Anthropic / Azure-OpenAI key |
 | `POSTGRES_PASSWORD` and matching `DATABASE_URL` | Choose your own |
 | `ALERT_TELEGRAM_BOT_TOKEN` / `_CHAT_ID` (optional) | Create via @BotFather, get chat id from @userinfobot |
@@ -375,6 +378,7 @@ Worked example — same trade, signal_sl=75000:
    - TP: computed per the formula above.
 3. **Breakeven move.** When unrealised profit crosses `BREAKEVEN_TRIGGER_PCT` (% of margin) in our favor, `breakeven_watcher` cancels the existing SL and places a new one at `entry × (1 ± buffer)` where `buffer ≈ 8 bps` covers exit fees. From this point the position cannot close in the red — worst case is exit at ~0.
 4. **SL safety watchdog** (every 30s) verifies every `open` position has an active SL on the exchange. Missing → `ERROR_NAKED_POSITION` alert. A separate `lighter_sl_watchdog` re-places SL on lighter specifically, where the exchange occasionally drops trigger orders for opaque reasons.
+5. **TP safety watchdog** (every 30s) verifies every `open` position with `sl_moved_to_be_at IS NULL` has an active TP. Missing → recompute the target via the same formula used at post-fill and re-place via the verified-trigger path. Rate-limited at 6 attempts/hour/position; final failure surfaces `ERROR_NO_TP`. This recovers from the common pattern "VOOI returned 503 during the post-fill TP POST and the bot gave up".
 
 > Caveat at high leverage: at `lev ≥ 7`, the fixed 8-bps BE buffer (in % of
 > price) can exceed `BREAKEVEN_TRIGGER_PCT / leverage`. The breakeven move
@@ -405,7 +409,7 @@ Worked example — same trade, signal_sl=75000:
 These must be set per deployment. `.env` is git-ignored.
 
 - `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`
-- `VOOI_API_KEY`, `VOOI_BROKER_ID_*`
+- `VOOI_API_KEY`
 - `LLM_API_KEY`
 - `POSTGRES_PASSWORD` / full `DATABASE_URL`
 - `ALERT_TELEGRAM_BOT_TOKEN`, `ALERT_TELEGRAM_CHAT_ID`
@@ -420,7 +424,7 @@ All commands are invoked as `python -m bot <command>` (or `bot <command>` after 
 
 | Command | Purpose |
 |---|---|
-| `run` | Start all 5 concurrent tasks. Foreground process; supervise externally (systemd / docker). |
+| `run` | Start all 7 concurrent tasks. Foreground process; supervise externally (systemd / docker). |
 | `status` | Health probe: DB connectivity, counts, last activity. |
 | `vooi-check` | Validate `VOOI_API_KEY` against `/exchange/positions`. |
 | `tg-login` | Interactive Telethon login; creates `*.session` file. Run once before `run`. |

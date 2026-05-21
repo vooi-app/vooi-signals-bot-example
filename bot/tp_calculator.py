@@ -30,7 +30,8 @@ def compute_tp_price(
         avg_entry_price: Confirmed fill price (from SSE avgEntryPrice)
         side: 'buy' or 'sell'
         leverage: Position leverage multiplier
-        exit_fees_bps_round_trip: (exit_taker_bps + builder_fee_bps) * 2
+        exit_fees_bps_round_trip: quote_fees_bps_one_way * 2 (VOOI's reported
+            feesBps already covers any server-side broker/builder fee).
         exit_slippage_bps: One-way exit slippage only (limit entry = 0 entry slippage)
 
     Returns:
@@ -43,8 +44,8 @@ def compute_tp_price(
         BTC long, entry=65000, leverage=10
         MIN_PROFIT_PCT_OF_COLLATERAL=5 → required gain 0.5% of price
         TP_OVERHEAD_FLOOR_PCT=2        → floor 0.2% of price
-        HL taker fee exit: 4.5 bps + builder 15 bps = 19.5 bps → round-trip 39 bps
-        Exit slippage: 5 bps (one-way) + funding 5 bps → 49 bps raw overhead
+        Quote feesBps one-way = 19.5 bps → round-trip 39 bps
+        Exit slippage 5 bps + funding 5 bps → 49 bps raw overhead
         49 bps > 20 bps floor → use raw overhead 0.49%
         Total: 0.5% + 0.49% = 0.99% above entry
         TP price: 65000 × 1.0099 ≈ 65643.5
@@ -70,34 +71,25 @@ def compute_breakeven_sl_price(
     entry_price: Decimal,
     side: str,
     exit_taker_bps: Decimal,
-    builder_bps: Optional[Decimal] = None,
     safety_bps: Decimal = Decimal("5"),
-    exchange: Optional[str] = None,
 ) -> Decimal:
     """
     Compute breakeven SL price — the price at which we exit at net zero.
 
-    Buffer = (exit_taker_bps + builder_bps * 2 + safety_5bps) / 10000
-    This covers the cost of exiting without a loss.
+    Buffer covers: entry fee already paid + exit fee (both legs) + safety.
+    VOOI applies the builder fee server-side and reports the combined value
+    via /exchange/quotes feesBps, so we no longer add it separately.
 
     Args:
         entry_price: Confirmed fill price
         side: 'buy' or 'sell'
-        exit_taker_bps: Exchange taker fee for exit leg (bps)
-        builder_bps: VOOI builder fee (bps). If None, taken from settings for the given exchange.
+        exit_taker_bps: One-way exit fee in bps (as reported by VOOI)
         safety_bps: Extra safety buffer (bps), default 5
-        exchange: Exchange name (required if builder_bps is None)
 
     Returns:
         Breakeven SL price
     """
-    if builder_bps is None:
-        if exchange is None:
-            raise ValueError("Either builder_bps or exchange must be provided")
-        builder_bps = settings.get_broker_fee_bps_effective(exchange)
-
-    # Buffer covers: entry fee already paid + exit fee + builder (both ways) + safety
-    buffer_bps = exit_taker_bps + builder_bps * Decimal("2") + safety_bps
+    buffer_bps = exit_taker_bps * Decimal("2") + safety_bps
     buffer_pct = buffer_bps / Decimal("10000")
 
     if side == "buy":
@@ -106,15 +98,15 @@ def compute_breakeven_sl_price(
         return entry_price * (Decimal("1") - buffer_pct)
 
 
-def exit_fees_bps_round_trip(exchange: str, fees_bps_from_quote: Decimal) -> Decimal:
+def exit_fees_bps_round_trip(fees_bps_from_quote: Decimal) -> Decimal:
     """
-    Compute round-trip exit fee overhead.
-    = (exchange_fee + builder_fee) * 2
-    Factor of 2 accounts for: exit leg (taker) + entry leg (maker, but we use taker conservatively)
-    Builder fee is taken per-exchange (Hyperliquid/Lighter/Aster have different rates).
+    Compute round-trip exit fee overhead from a quote value.
+
+    Returns fees_bps_from_quote * 2 — the factor of 2 accounts for both
+    entry and exit legs paying the same fee. VOOI's reported feesBps already
+    includes any server-side broker/builder component.
     """
-    builder_bps = settings.get_broker_fee_bps_effective(exchange)
-    return (fees_bps_from_quote + builder_bps) * Decimal("2")
+    return fees_bps_from_quote * Decimal("2")
 
 
 def exit_slippage_bps_for_limit(slippage_bps_from_quote: Decimal) -> Decimal:
@@ -143,10 +135,10 @@ def compute_tp_price_with_fallback(
     Uses conservative one-way exit slippage of 5 bps when no quote.
     """
     if quote_fees_bps is not None:
-        fees_rt = exit_fees_bps_round_trip(exchange, quote_fees_bps)
+        fees_rt = exit_fees_bps_round_trip(quote_fees_bps)
     else:
         fallback = get_fallback_fees_bps(exchange)
-        fees_rt = exit_fees_bps_round_trip(exchange, fallback)
+        fees_rt = exit_fees_bps_round_trip(fallback)
 
     if quote_slippage_bps is not None:
         slippage = exit_slippage_bps_for_limit(quote_slippage_bps)

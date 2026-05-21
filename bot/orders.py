@@ -224,8 +224,6 @@ async def place_trigger_with_verification(
     trigger_type: str,
     trigger_price: Decimal,
     size: Decimal,
-    broker_id: str,
-    broker_fee_bps: str,
     client_order_id: str,
     timeout_sec: float = 20.0,
 ) -> bool:
@@ -241,6 +239,9 @@ async def place_trigger_with_verification(
 
     Updates `order_row.status`, `order_row.vooi_order_id`, and `order_row.raw_response`
     in place; caller owns the session/commit.
+
+    Builder/broker metadata is no longer attached client-side — VOOI assigns
+    it server-side based on the API key.
     """
     body = {
         "exchange": position.exchange,
@@ -250,7 +251,6 @@ async def place_trigger_with_verification(
         "reduceOnly": True,
         "trigger": {"price": str(trigger_price), "type": trigger_type},
         "clientOrderId": client_order_id,
-        "broker": {"id": broker_id, "feeBps": broker_fee_bps},
     }
 
     for attempt in range(1, 4):
@@ -713,7 +713,6 @@ async def place_entry_order(
     # Per spec §8.5 v1.5: TP and SL are placed post-fill by post_fill_placer.
     # Aster explicitly rejects bracket fields ("Aster exchange does not support
     # bracket orders") and Hyperliquid / Lighter work fine without them.
-    broker_id = settings.get_broker_id(exchange)
     order_body = {
         "exchange": exchange,
         "asset": symbol_normalized,
@@ -722,10 +721,6 @@ async def place_entry_order(
         "price": str(entry_price_rounded),
         "timeInForce": "gtc",
         "clientOrderId": client_order_id,
-        "broker": {
-            "id": broker_id,
-            "feeBps": settings.get_broker_fee_bps(exchange),
-        },
     }
 
     try:

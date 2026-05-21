@@ -234,8 +234,6 @@ async def _place_tp_sl(entry_order_id: int, avg_entry_price: Optional[Decimal]) 
         sl_price_rounded = round_price(sl_price, price_decimals, exit_side)
         size_rounded = round_size(position.size, size_decimals)
 
-        broker_id = settings.get_broker_id(position.exchange)
-        broker_fee_bps = settings.get_broker_fee_bps(position.exchange)
         client = get_vooi_client()
 
         # ---------- SL ----------
@@ -264,8 +262,6 @@ async def _place_tp_sl(entry_order_id: int, avg_entry_price: Optional[Decimal]) 
             trigger_type="sl",
             trigger_price=sl_price_rounded,
             size=size_rounded,
-            broker_id=broker_id,
-            broker_fee_bps=broker_fee_bps,
             client_order_id=sl_client_oid,
         )
 
@@ -295,8 +291,6 @@ async def _place_tp_sl(entry_order_id: int, avg_entry_price: Optional[Decimal]) 
             trigger_type="tp",
             trigger_price=tp_price_rounded,
             size=size_rounded,
-            broker_id=broker_id,
-            broker_fee_bps=broker_fee_bps,
             client_order_id=tp_client_oid,
         )
 

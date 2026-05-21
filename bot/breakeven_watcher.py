@@ -203,7 +203,6 @@ async def move_sl_to_breakeven(position: Position) -> None:
             entry_price=pos.entry_price,
             side=pos.side,
             exit_taker_bps=exit_taker_bps,
-            exchange=pos.exchange,
         )
 
         price_decimals = await get_price_decimals(pos.symbol, pos.exchange)
@@ -213,7 +212,6 @@ async def move_sl_to_breakeven(position: Position) -> None:
         size_rounded = round_size(pos.size, size_decimals)
 
         client = get_vooi_client()
-        broker_id = cfg.get_broker_id(pos.exchange)
 
         # Cancel existing SL order. Per Swagger, DELETE /exchange/orders takes
         # {exchange, asset, orderId} and returns {status: "ok"} on success.
@@ -309,8 +307,6 @@ async def move_sl_to_breakeven(position: Position) -> None:
             trigger_type="sl",
             trigger_price=be_price_rounded,
             size=size_rounded,
-            broker_id=broker_id,
-            broker_fee_bps=cfg.get_broker_fee_bps(pos.exchange),
             client_order_id=be_sl_client_oid,
         )
 

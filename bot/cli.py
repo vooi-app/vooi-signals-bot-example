@@ -69,13 +69,17 @@ def run() -> None:
 
 
 async def _run_all_tasks() -> None:
-    """Start all six concurrent async tasks."""
+    """Start all seven concurrent async tasks."""
     from bot.db import dispose_engine
     from bot.ingester import ingester_task
     from bot.reconciler import reconciler_task
     from bot.sse_listener import sse_listener_task
     from bot.breakeven_watcher import tp_breakeven_watcher_task
-    from bot.sl_safety import lighter_sl_watchdog_task, sl_safety_check_task
+    from bot.sl_safety import (
+        lighter_sl_watchdog_task,
+        sl_safety_check_task,
+        tp_safety_watchdog_task,
+    )
     from bot.startup_cleanup import run_startup_cleanup
 
     # Run alembic migrations on startup
@@ -94,6 +98,7 @@ async def _run_all_tasks() -> None:
         asyncio.create_task(tp_breakeven_watcher_task(), name="breakeven_watcher"),
         asyncio.create_task(sl_safety_check_task(), name="sl_safety"),
         asyncio.create_task(lighter_sl_watchdog_task(), name="lighter_sl_watchdog"),
+        asyncio.create_task(tp_safety_watchdog_task(), name="tp_safety_watchdog"),
     ]
 
     console.print(f"[green]All {len(tasks)} tasks started.[/green]")
@@ -230,12 +235,6 @@ async def _vooi_check() -> None:
                 console.print(f"  Available margin: {available}")
         except Exception as e:
             console.print(f"[red]✗[/red] API key check failed: {e}")
-
-        # Check broker IDs and per-exchange builder fees
-        for exchange in ["hyperliquid", "lighter", "aster"]:
-            broker_id = settings.get_broker_id(exchange)
-            fee = settings.get_broker_fee_bps(exchange)
-            console.print(f"  Broker ({exchange}): id={broker_id}  feeBps={fee}")
 
         console.print(f"  Default leverage: {settings.default_leverage}x")
         console.print(f"  Max position size: ${settings.max_position_size_usd}")

@@ -24,14 +24,9 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     vooi_api_base_url: str = "https://perps-api.vooi.io"
     vooi_api_key: str
-    vooi_broker_id_hyperliquid: str
-    vooi_broker_id_lighter: str
-    vooi_broker_id_aster: str
-    # Per-exchange builder fee in basis points. Stored as string so VOOI API
-    # receives the exact same shape it expects (e.g. "1.5", "15", "150").
-    vooi_broker_fee_bps_hyperliquid: str = "15"
-    vooi_broker_fee_bps_lighter: str = "150"
-    vooi_broker_fee_bps_aster: str = "1.5"
+    # NOTE: Broker / builder identity and fees are now assigned by VOOI on the
+    # server side (keyed off the API key). The bot no longer sends them in the
+    # order body; the broker fee is included in VOOI's reported quote.feesBps.
 
     # -------------------------------------------------------------------------
     # LLM
@@ -135,52 +130,6 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
-    def get_broker_id(self, exchange: str) -> str:
-        mapping = {
-            "hyperliquid": self.vooi_broker_id_hyperliquid,
-            "lighter": self.vooi_broker_id_lighter,
-            "aster": self.vooi_broker_id_aster,
-        }
-        result = mapping.get(exchange.lower())
-        if result is None:
-            raise ValueError(f"Unknown exchange: {exchange}")
-        return result
-
-    def get_broker_fee_bps(self, exchange: str) -> str:
-        mapping = {
-            "hyperliquid": self.vooi_broker_fee_bps_hyperliquid,
-            "lighter": self.vooi_broker_fee_bps_lighter,
-            "aster": self.vooi_broker_fee_bps_aster,
-        }
-        result = mapping.get(exchange.lower())
-        if result is None:
-            raise ValueError(f"Unknown exchange: {exchange}")
-        return result
-
-    # Per-exchange wire-format scale for the broker-fee field. VOOI accepts
-    # the raw string verbatim (".env=15" for hyperliquid, ".env=150" for
-    # lighter, ".env=1.5" for aster), but each exchange's adapter divides by
-    # a different constant to arrive at the actual basis-point figure (which
-    # is currently 1.5 bps everywhere). Use these divisors *only* for our
-    # internal TP/SL math; the raw value still goes into the VOOI order body.
-    _BROKER_FEE_BPS_SCALE: dict[str, Decimal] = {
-        "aster": Decimal("1"),
-        "hyperliquid": Decimal("10"),
-        "lighter": Decimal("100"),
-    }
-
-    def get_broker_fee_bps_effective(self, exchange: str) -> Decimal:
-        """
-        True basis-point value of the broker fee, after applying the
-        per-exchange wire-format scale. Use in TP/SL math; never in the
-        VOOI API body (that field expects the raw string from .env).
-        """
-        raw = Decimal(self.get_broker_fee_bps(exchange))
-        scale = self._BROKER_FEE_BPS_SCALE.get(exchange.lower())
-        if scale is None:
-            raise ValueError(f"Unknown exchange: {exchange}")
-        return raw / scale
-
     def get_fee_fallback_bps(self, exchange: str) -> Decimal:
         mapping = {
             "hyperliquid": self.fee_fallback_taker_bps_hyperliquid,

@@ -119,7 +119,7 @@ A console-based automated trading bot that:
                  └─────────────────────┘
 ```
 
-**Six concurrent async tasks** in one process:
+**Seven concurrent async tasks** in one process:
 
 | Task | Period | Responsibility |
 |------|--------|----------------|
@@ -144,10 +144,8 @@ SIGNAL_CHECKPOINT_NOTIFY_TELEGRAM=true   # send Telegram alert to operator on ea
 # VOOI
 VOOI_API_BASE_URL=https://perps-api.vooi.io
 VOOI_API_KEY=...                         # Perpetual API key — no expiry
-VOOI_BROKER_ID_HYPERLIQUID=0x...
-VOOI_BROKER_ID_LIGHTER=...
-VOOI_BROKER_ID_ASTER=0x...
-VOOI_BROKER_FEE_BPS=15
+# Broker identity and fees are now assigned by VOOI server-side based on the
+# API key. The bot no longer sets VOOI_BROKER_ID_* / VOOI_BROKER_FEE_BPS_*.
 
 # LLM
 LLM_PROVIDER=openai
@@ -397,7 +395,7 @@ body = {
     "price": format_price(entry_price, price_decimals, signal.side),  # always limit
     "timeInForce": "gtc",
     "clientOrderId": client_order_id,
-    "broker": {"id": broker_id, "feeBps": settings.VOOI_BROKER_FEE_BPS},
+    # NO broker field — VOOI assigns it server-side.
     # NO stopLoss / takeProfit — placed after fill
 }
 
@@ -432,10 +430,11 @@ Let:
   E   = avgEntryPrice (confirmed fill price from SSE, = limit price for limits)
   L   = leverage
   C   = collateral in USD (notional / L)
-  fb  = round-trip broker+exchange fees in bps
-        = (exit_taker_bps + builder_fee_bps) * 2
-        Note: entry taker fee is NOT doubled here because this is a limit order
-              (maker fill on most DEXs = 0 or lower fee; use exit_taker for conservatism)
+  fb  = round-trip exit fee overhead in bps
+        = quote.feesBps * 2
+        VOOI's quote.feesBps already includes any server-side broker/builder
+        fee; we double it because the same one-way fee applies on entry and
+        exit legs.
   sb  = exit-only slippage in bps (from GET /exchange/quotes, one-way only)
         Limit entry has zero slippage; only exit slippage matters
   fund= FUNDING_COST_BUFFER_BPS (default 5)
@@ -458,7 +457,7 @@ that would place TP so close to entry that real fees+slippage eat the profit.
 #### 8.6.2. Worked example (updated)
 
 Signal: BTC long, limit entry 65000, leverage 10, $500 collateral ($5000 notional).
-- HL taker fee (exit only): 4.5 bps + builder fee 15 bps = 19.5 bps one-way exit
+- Quote feesBps (one-way, server-side broker fee included): 19.5 bps
 - Round-trip fee overhead: 19.5 × 2 = 39 bps
 - Exit slippage from quote: 5 bps (one-way only)
 - Funding buffer: 5 bps
@@ -469,12 +468,13 @@ Signal: BTC long, limit entry 65000, leverage 10, $500 collateral ($5000 notiona
 - TP target: 0.99% above entry
 - TP price: 65000 × 1.0099 ≈ 65643.5
 
-*(Composition vs v1.4: no entry slippage, funding buffer added, floor is now % of margin.)*
+*(Composition vs v1.4: no entry slippage, funding buffer added, floor is now %
+of margin, broker fee is bundled into quote.feesBps server-side.)*
 
 Counter-example (lighter, where raw overhead is tiny):
-- lighter taker=0 + builder_eff=1.5 → round-trip 3 bps; slippage 5 bps; funding 5 bps → raw 13 bps = 0.13% of price
+- Quote feesBps=0; slippage 5 bps; funding 5 bps → raw 10 bps = 0.10% of price
 - Floor: 2% of margin / 5 (lev) = 0.40% of price
-- 0.13% < 0.40% → use floor 0.40%
+- 0.10% < 0.40% → use floor 0.40%
 - Required net gain: 3% of margin / 5 = 0.60% of price
 - Total 1.00% of price → BTC entry 77200 → TP 77972
 
@@ -485,7 +485,7 @@ def compute_tp_price(
     avg_entry_price: Decimal,
     side: str,
     leverage: int,
-    exit_fees_bps_round_trip: Decimal,  # (exit_taker + builder) * 2
+    exit_fees_bps_round_trip: Decimal,  # quote.feesBps * 2
     exit_slippage_bps: Decimal,          # one-way only (limit entry = no entry slippage)
 ) -> Decimal:
     P = Decimal(settings.MIN_PROFIT_PCT_OF_COLLATERAL)
@@ -506,8 +506,8 @@ def compute_tp_price(
 
 
 def exit_fees_bps_round_trip_for(quote: GetQuotesItem) -> Decimal:
-    # One exit taker fee + builder fee on both sides
-    return Decimal(quote.quote.feesBps) * 2 + Decimal(settings.VOOI_BROKER_FEE_BPS) * 2
+    # quote.feesBps already includes the server-side broker/builder fee
+    return Decimal(quote.quote.feesBps) * 2
 
 
 def exit_slippage_bps_for(quote: GetQuotesItem) -> Decimal:
@@ -522,7 +522,7 @@ FALLBACK_EXIT_FEES_BPS = {
     'lighter':     Decimal(settings.FEE_FALLBACK_TAKER_BPS_LIGHTER),
     'aster':       Decimal(settings.FEE_FALLBACK_TAKER_BPS_ASTER),
 }
-exit_fees_bps_round_trip = FALLBACK_EXIT_FEES_BPS[exchange] * 2 + Decimal(settings.VOOI_BROKER_FEE_BPS) * 2
+exit_fees_bps_round_trip = FALLBACK_EXIT_FEES_BPS[exchange] * 2
 exit_slippage_bps = Decimal('5')  # conservative one-way fallback
 ```
 
@@ -559,7 +559,6 @@ async def on_entry_filled(order_fill_event):
         "reduceOnly": True,
         "trigger": {"price": format_price(sl_price, ...), "type": "sl"},
         "clientOrderId": sl_client_oid,
-        "broker": {"id": broker_id, "feeBps": settings.VOOI_BROKER_FEE_BPS},
     })
 
     # Place TP (reduce-only, take profit trigger)
@@ -572,7 +571,6 @@ async def on_entry_filled(order_fill_event):
         "reduceOnly": True,
         "trigger": {"price": format_price(tp_price, ...), "type": "tp"},
         "clientOrderId": tp_client_oid,
-        "broker": {"id": broker_id, "feeBps": settings.VOOI_BROKER_FEE_BPS},
     })
 
     # Persist
@@ -683,8 +681,8 @@ For testing acceptance criterion #16 without waiting for real price movement:
 
 | Category | Strategy |
 |---|---|
-| Entry order fill received but TP placement fails | Retry TP placement once (1s backoff). If still failing — `sl_safety_check` catches it. |
-| Entry order fill received but SL placement fails | Same. `ERROR_NAKED_POSITION` within 30s if no SL appears. |
+| Entry order fill received but TP placement fails | Inline retry × 3. If still failing, `tp_safety_watchdog` keeps retrying every 30s (rate-limited 6/h per position). `sl_safety_check` emits `ERROR_NO_TP`. |
+| Entry order fill received but SL placement fails | Inline retry × 3. `ERROR_NAKED_POSITION` within 30s if no SL appears. `lighter_sl_watchdog` re-places on lighter (3/h). |
 | `open_pending_tp_sl` position stuck >60s | Reconciler re-triggers `on_entry_filled` once. If still stuck — emit ERROR. |
 | `tp_breakeven_watcher` heartbeat stale >30s | `sl_safety_check` emits `ERROR_WATCHER_HUNG`. Operator must inspect asyncio task. |
 
@@ -694,22 +692,37 @@ Removed from v1.4: JWT expiry handling — API keys are perpetual.
 ```python
 async def sl_safety_check():
     while True:
-        # 1. Naked position check (existing)
         open_positions = db.positions.filter(status='open')
         for pos in open_positions:
+            # 1. Naked SL check
             active_sl = db.orders.filter(
                 id=pos.sl_order_id, status__in=('pending', 'open')
             ).exists()
             if not active_sl:
                 alert('ERROR_NAKED_POSITION', position=pos)
 
-        # 2. Watcher heartbeat check (new)
+            # 2. Missing TP check (only while SL has not been moved to BE —
+            # once SL ≥ breakeven, the TP is no longer required for safety).
+            if pos.sl_moved_to_be_at is None:
+                active_tp = db.orders.filter(
+                    id=pos.tp_order_id, status__in=('pending', 'open')
+                ).exists()
+                if not active_tp:
+                    alert('ERROR_NO_TP', position=pos)
+
+        # 3. Watcher heartbeat check
         watcher_age = time.time() - tp_breakeven_watcher_last_tick
         if watcher_age > 30:
             alert('ERROR_WATCHER_HUNG', age_sec=watcher_age)
 
         await asyncio.sleep(30)
 ```
+
+**`tp_safety_watchdog_task` (every 30s):** scans open positions for a missing
+TP order and re-places via the same verified-trigger helper used by post-fill.
+Rate-limit: `_TP_WATCHDOG_MAX_ATTEMPTS_PER_HOUR = 6` per position. Beyond that,
+emits a final `ERROR_NO_TP` and stops retrying. Skips positions where
+`sl_moved_to_be_at IS NOT NULL` (BE-SL already locks in profit).
 
 ---
 

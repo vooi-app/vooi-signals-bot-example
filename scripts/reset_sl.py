@@ -120,9 +120,6 @@ async def _reset_one(position: Position, *, apply: bool) -> None:
         session.add(new_order)
         await session.flush()
 
-        broker_id = settings.get_broker_id(position_db.exchange)
-        broker_fee_bps = settings.get_broker_fee_bps(position_db.exchange)
-
         placed = await place_trigger_with_verification(
             client=client,
             position=position_db,
@@ -130,8 +127,6 @@ async def _reset_one(position: Position, *, apply: bool) -> None:
             trigger_type="sl",
             trigger_price=new_sl,
             size=size,
-            broker_id=broker_id,
-            broker_fee_bps=broker_fee_bps,
             client_order_id=new_client_oid,
         )
 

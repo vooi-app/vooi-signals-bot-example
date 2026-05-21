@@ -30,6 +30,7 @@ from bot.resolver import (
 from bot.streamer import emit_event
 from bot.tp_calculator import (
     compute_sl_price_from_pct,
+    compute_tp_price_with_fallback,
     opposite_side,
     round_price,
     round_size,
@@ -42,10 +43,13 @@ _WATCHER_HEARTBEAT_THRESHOLD_SEC = 30
 _CHECK_INTERVAL_SEC = 30
 _LIGHTER_WATCHDOG_INTERVAL_SEC = 30
 _LIGHTER_WATCHDOG_MAX_ATTEMPTS_PER_HOUR = 3
+_TP_WATCHDOG_INTERVAL_SEC = 30
+_TP_WATCHDOG_MAX_ATTEMPTS_PER_HOUR = 6
 
 # In-memory rate-limit: position_id → list[datetime] of replacement attempts.
 # Resets on bot restart; that's acceptable — restart implies fresh slate.
 _lighter_replacement_attempts: dict[int, list[datetime]] = {}
+_tp_replacement_attempts: dict[int, list[datetime]] = {}
 
 
 async def sl_safety_check_task() -> None:
@@ -78,8 +82,9 @@ async def sl_safety_check_run() -> None:
 
 async def check_naked_positions(session: AsyncSession) -> None:
     """
-    For each open position: verify active SL exists.
-    If not → emit ERROR_NAKED_POSITION and send Telegram alert.
+    For each open position: verify active SL and TP orders exist.
+    SL missing → emit ERROR_NAKED_POSITION (immediate risk).
+    TP missing → emit ERROR_NO_TP (no immediate risk, but profit ceiling lost).
     """
     result = await session.execute(
         select(Position).where(Position.status == "open")
@@ -87,8 +92,8 @@ async def check_naked_positions(session: AsyncSession) -> None:
     open_positions = result.scalars().all()
 
     for pos in open_positions:
+        # ---- SL ----
         has_active_sl = False
-
         if pos.sl_order_id:
             sl_result = await session.execute(
                 select(Order).where(
@@ -98,8 +103,7 @@ async def check_naked_positions(session: AsyncSession) -> None:
                     )
                 )
             )
-            sl_order = sl_result.scalar_one_or_none()
-            has_active_sl = sl_order is not None
+            has_active_sl = sl_result.scalar_one_or_none() is not None
         elif pos.sl_price_current is not None:
             # Atomic bracket: SL submitted with entry; no separate orderId yet.
             has_active_sl = True
@@ -124,6 +128,44 @@ async def check_naked_positions(session: AsyncSession) -> None:
                 ),
             )
             await send_naked_position_alert(pos.id, pos.symbol, pos.exchange)
+
+        # ---- TP ----
+        # SL after a breakeven move is allowed to "be" the TP (locks profit),
+        # so once sl_moved_to_be_at is set we don't insist on a separate TP.
+        if pos.sl_moved_to_be_at is not None:
+            continue
+
+        has_active_tp = False
+        if pos.tp_order_id:
+            tp_result = await session.execute(
+                select(Order).where(
+                    and_(
+                        Order.id == pos.tp_order_id,
+                        Order.status.in_(["pending", "open"]),
+                    )
+                )
+            )
+            has_active_tp = tp_result.scalar_one_or_none() is not None
+
+        if not has_active_tp:
+            log.error(
+                "ERROR_NO_TP",
+                position_id=pos.id,
+                symbol=pos.symbol,
+                exchange=pos.exchange,
+                tp_order_id=pos.tp_order_id,
+            )
+            await emit_event(
+                "ERROR_NO_TP",
+                level="ERROR",
+                position_id=pos.id,
+                exchange=pos.exchange,
+                symbol=pos.symbol,
+                message=(
+                    f"Position {pos.id} {pos.symbol} on {pos.exchange} "
+                    f"has no active TP order. tp_safety_watchdog will retry."
+                ),
+            )
 
 
 async def check_watcher_heartbeat() -> None:
@@ -319,9 +361,6 @@ async def _replace_lighter_sl(
         sl_price=str(sl_price),
     )
 
-    broker_id = settings.get_broker_id(pos.exchange)
-    broker_fee_bps = settings.get_broker_fee_bps(pos.exchange)
-
     placed = await place_trigger_with_verification(
         client=client,
         position=pos,
@@ -329,8 +368,6 @@ async def _replace_lighter_sl(
         trigger_type="sl",
         trigger_price=sl_price,
         size=size_rounded,
-        broker_id=broker_id,
-        broker_fee_bps=broker_fee_bps,
         client_order_id=coid,
     )
 
@@ -359,6 +396,198 @@ async def _replace_lighter_sl(
     else:
         log.error(
             "lighter_sl_watchdog_replace_failed",
+            position_id=pos.id,
+            symbol=pos.symbol,
+            attempt=attempt_count,
+        )
+
+
+# -----------------------------------------------------------------------------
+# TP safety watchdog (cross-exchange)
+#
+# Mirrors the lighter SL watchdog pattern but for take-profit orders. The
+# common failure mode is: VOOI returns 503 during the post-fill TP POST and
+# the bot gives up after 3 immediate retries; the position then lives without
+# a profit ceiling. This task picks up such positions and keeps retrying with
+# a per-position hourly cap.
+# -----------------------------------------------------------------------------
+def _record_tp_attempt(position_id: int) -> int:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=1)
+    history = _tp_replacement_attempts.setdefault(position_id, [])
+    history.append(now)
+    history[:] = [t for t in history if t > cutoff]
+    return len(history)
+
+
+def _tp_attempts_in_last_hour(position_id: int) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    history = _tp_replacement_attempts.get(position_id, [])
+    return sum(1 for t in history if t > cutoff)
+
+
+async def tp_safety_watchdog_task() -> None:
+    """
+    Every 30s: scan open positions; if any has no active TP (excluding those
+    where SL has already been moved to breakeven), recompute the TP price
+    and place it. Rate-limited per position.
+    """
+    while True:
+        try:
+            await asyncio.sleep(_TP_WATCHDOG_INTERVAL_SEC)
+            await tp_safety_watchdog_run()
+        except asyncio.CancelledError:
+            log.info("tp_safety_watchdog_cancelled")
+            break
+        except Exception as e:
+            log.error("tp_safety_watchdog_error", error=str(e))
+
+
+async def tp_safety_watchdog_run() -> None:
+    client = get_vooi_client()
+
+    async with session_scope() as session:
+        result = await session.execute(
+            select(Position).where(Position.status == "open")
+        )
+        open_positions = list(result.scalars())
+
+        for pos in open_positions:
+            # Skip positions whose SL has already locked in profit (BE move
+            # ran) — TP is redundant once SL is at/above breakeven.
+            if pos.sl_moved_to_be_at is not None:
+                continue
+
+            tp_active = False
+            if pos.tp_order_id:
+                tp_result = await session.execute(
+                    select(Order).where(
+                        and_(
+                            Order.id == pos.tp_order_id,
+                            Order.status.in_(["pending", "open"]),
+                        )
+                    )
+                )
+                tp_active = tp_result.scalar_one_or_none() is not None
+
+            if tp_active:
+                continue
+
+            attempts = _tp_attempts_in_last_hour(pos.id)
+            if attempts >= _TP_WATCHDOG_MAX_ATTEMPTS_PER_HOUR:
+                log.error(
+                    "tp_safety_watchdog_rate_limited",
+                    position_id=pos.id,
+                    symbol=pos.symbol,
+                    attempts=attempts,
+                )
+                await emit_event(
+                    "ERROR_NO_TP",
+                    level="ERROR",
+                    position_id=pos.id,
+                    exchange=pos.exchange,
+                    symbol=pos.symbol,
+                    message=(
+                        f"tp_safety_watchdog exhausted {attempts} TP placement "
+                        f"attempts in the last hour for position {pos.id} "
+                        f"{pos.symbol}. Manual intervention required."
+                    ),
+                )
+                continue
+
+            await _replace_tp(session, client, pos)
+
+
+async def _replace_tp(
+    session: AsyncSession,
+    client,
+    pos: Position,
+) -> None:
+    """Compute fresh TP for pos and place it via the verified helper."""
+    try:
+        price_decimals = await get_price_decimals(pos.symbol, pos.exchange)
+        size_decimals = await get_size_decimals(pos.symbol, pos.exchange)
+    except MarketDecimalsUnavailable as e:
+        log.error(
+            "tp_safety_watchdog_decimals_unavailable",
+            position_id=pos.id, symbol=pos.symbol, error=str(e),
+        )
+        return
+
+    # Reuse stored target if it exists; otherwise recompute.
+    tp_price_raw: Optional[Decimal] = pos.tp_price_initial
+    if tp_price_raw is None:
+        tp_price_raw = compute_tp_price_with_fallback(
+            avg_entry_price=pos.entry_price,
+            side=pos.side,
+            leverage=pos.leverage,
+            exchange=pos.exchange,
+        )
+
+    exit_side = opposite_side(pos.side)
+    tp_price = round_price(Decimal(str(tp_price_raw)), price_decimals, exit_side)
+    size_rounded = round_size(pos.size, size_decimals)
+
+    coid = make_client_order_id(pos.signal_id or 0, pos.exchange, suffix="wdtp")
+    new_tp = Order(
+        signal_id=pos.signal_id,
+        client_order_id=coid,
+        order_type="takeProfit",
+        exchange=pos.exchange,
+        symbol=pos.symbol,
+        side=exit_side,
+        status="submitting",
+        trigger_price=tp_price,
+        size=size_rounded,
+        reduce_only=True,
+    )
+    session.add(new_tp)
+    await session.flush()
+
+    attempt_count = _record_tp_attempt(pos.id)
+    log.warning(
+        "tp_safety_watchdog_replacing",
+        position_id=pos.id,
+        symbol=pos.symbol,
+        attempt=attempt_count,
+        tp_price=str(tp_price),
+    )
+
+    placed = await place_trigger_with_verification(
+        client=client,
+        position=pos,
+        order_row=new_tp,
+        trigger_type="tp",
+        trigger_price=tp_price,
+        size=size_rounded,
+        client_order_id=coid,
+    )
+
+    if placed:
+        pos.tp_order_id = new_tp.id
+        pos.tp_price_initial = tp_price
+        pos.last_synced_at = datetime.now(timezone.utc)
+        await session.flush()
+        log.info(
+            "tp_safety_watchdog_replaced",
+            position_id=pos.id,
+            symbol=pos.symbol,
+            new_tp_order_id=new_tp.id,
+            vooi_order_id=new_tp.vooi_order_id,
+        )
+        await emit_event(
+            "TP_REPLACED_BY_WATCHDOG",
+            position_id=pos.id,
+            exchange=pos.exchange,
+            symbol=pos.symbol,
+            message=(
+                f"TP placement was missing for position {pos.id} {pos.symbol}; "
+                f"replaced at {tp_price}."
+            ),
+        )
+    else:
+        log.error(
+            "tp_safety_watchdog_replace_failed",
             position_id=pos.id,
             symbol=pos.symbol,
             attempt=attempt_count,
