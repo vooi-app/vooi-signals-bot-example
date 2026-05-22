@@ -486,7 +486,7 @@ async def update_dd_state(session: AsyncSession) -> None:
     result = await session.execute(
         select(func.sum(Position.realized_pnl_usd)).where(
             and_(
-                Position.status.in_(["closed_tp", "closed_sl", "closed_breakeven", "closed_manual", "liquidated"]),
+                Position.status.in_(["closed_tp", "closed_sl", "closed_breakeven", "closed_manual", "closed_emergency", "liquidated"]),
                 func.date(Position.closed_at) == today,
             )
         )

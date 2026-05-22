@@ -216,6 +216,43 @@ async def verify_trigger_on_exchange(
     return None
 
 
+class TriggerWouldImmediatelyFireError(Exception):
+    """
+    Raised when an exchange rejects a trigger order because its trigger price
+    is already on the wrong side of the market — the order would fire the
+    instant it's accepted. Caller is expected to perform an emergency market
+    close instead of retrying with the same (now-stale) trigger price.
+
+    Aster wire signature: HTTP 503 + body containing
+    `"Order would immediately trigger.. Code: -2021"`.
+    """
+
+    def __init__(self, message: str, *, exchange: str, response_body: str = ""):
+        super().__init__(message)
+        self.exchange = exchange
+        self.response_body = response_body
+
+
+def _is_would_immediately_trigger_error(exc: BaseException) -> Optional[str]:
+    """
+    Return the offending response body if `exc` represents a "trigger would
+    immediately fire" rejection, else None. Matches Aster's
+    `Code: -2021 / Order would immediately trigger` plus a generic
+    "would immediately trigger" substring for forward compatibility with
+    Hyperliquid / Lighter wording we haven't observed yet.
+    """
+    parts: list[str] = []
+    response = getattr(exc, "response", None)
+    if response is not None:
+        text = getattr(response, "text", "") or ""
+        parts.append(str(text))
+    parts.append(str(exc))
+    blob = " ".join(parts).lower()
+    if "would immediately trigger" in blob or "code: -2021" in blob:
+        return parts[0] if parts and parts[0] else str(exc)
+    return None
+
+
 async def place_trigger_with_verification(
     client: VooiClient,
     position: Position,
@@ -260,6 +297,24 @@ async def place_trigger_with_verification(
                 timeout=timeout_sec,
             )
         except Exception as e:
+            offending = _is_would_immediately_trigger_error(e)
+            if offending is not None:
+                order_row.status = "rejected"
+                order_row.raw_response = offending[:4096]
+                log.error(
+                    "trigger_would_immediately_fire",
+                    position_id=position.id,
+                    trigger_type=trigger_type,
+                    exchange=position.exchange,
+                    symbol=position.symbol,
+                    trigger_price=str(trigger_price),
+                    response=offending[:200],
+                )
+                raise TriggerWouldImmediatelyFireError(
+                    f"{trigger_type} trigger @ {trigger_price} would immediately fire",
+                    exchange=position.exchange,
+                    response_body=offending,
+                )
             log.warning(
                 "trigger_post_attempt_failed",
                 position_id=position.id,
@@ -326,6 +381,133 @@ async def place_trigger_with_verification(
         trigger_type=trigger_type,
     )
     return False
+
+
+# Aggressive cross beyond top-of-book that virtually guarantees a taker fill
+# without going so far that exchange "price impact" guards kick in.
+_EMERGENCY_CLOSE_SLIPPAGE_PCT = Decimal("2")
+
+
+async def emergency_market_close(
+    client: VooiClient,
+    position: Position,
+    *,
+    reason: str,
+) -> Optional[str]:
+    """
+    Aggressive limit-IOC reduce-only close — used when a protective SL cannot
+    be placed because the trigger would fire immediately (market has already
+    blown past the intended stop). Returns the VOOI orderId on success, or
+    `None` if the API didn't echo an id (the order may still have filled;
+    reconciler will tidy up).
+
+    Pricing: fetch a sized quote on the closing side and cross it by
+    `_EMERGENCY_CLOSE_SLIPPAGE_PCT`. Crossed limit + IOC = taker fill on the
+    available book without legging through the spec's `v1` market-order ban
+    (limit orders are still the wire-level shape).
+    """
+    close_side = opposite_side(position.side)
+    size = position.size
+    try:
+        price_decimals = await get_price_decimals(client, position.exchange, position.symbol)
+        size_decimals = await get_size_decimals(client, position.exchange, position.symbol)
+    except MarketDecimalsUnavailable as e:
+        log.error(
+            "emergency_close_decimals_unavailable",
+            position_id=position.id,
+            exchange=position.exchange,
+            symbol=position.symbol,
+            error=str(e),
+        )
+        raise
+
+    size_rounded = round_size(size, size_decimals)
+
+    # Quote on the side we are about to send. averageExecutionPrice already
+    # reflects expected sweep through the book at our size.
+    quote_data = await client.get(
+        "/exchange/quotes",
+        params={
+            "asset": position.symbol,
+            "exchanges": position.exchange,
+            "side": close_side,
+            "quoteSize": str(size_rounded),
+            "leverage": "1",
+        },
+    )
+    ref_price: Optional[Decimal] = None
+    if isinstance(quote_data, list) and quote_data:
+        first = quote_data[0] if isinstance(quote_data[0], dict) else None
+        quote = first.get("quote") if first else None
+        if isinstance(quote, dict):
+            aep = quote.get("averageExecutionPrice")
+            if aep is not None:
+                try:
+                    ref_price = Decimal(str(aep))
+                except Exception:
+                    ref_price = None
+    if ref_price is None or ref_price <= 0:
+        raise RuntimeError(
+            f"emergency_close: cannot extract reference price from quotes for "
+            f"{position.exchange}/{position.symbol}: {str(quote_data)[:200]}"
+        )
+
+    slip = _EMERGENCY_CLOSE_SLIPPAGE_PCT / Decimal("100")
+    if close_side == "sell":
+        raw_price = ref_price * (Decimal("1") - slip)
+    else:
+        raw_price = ref_price * (Decimal("1") + slip)
+    aggressive_price = round_price(raw_price, price_decimals, close_side)
+
+    client_order_id = make_client_order_id(
+        position.signal_id or 0, position.exchange, suffix="emrg",
+    )
+    body = {
+        "exchange": position.exchange,
+        "asset": position.symbol,
+        "side": close_side,
+        "size": str(size_rounded),
+        "price": str(aggressive_price),
+        "timeInForce": "ioc",
+        "reduceOnly": True,
+        "clientOrderId": client_order_id,
+    }
+
+    log.warning(
+        "emergency_close_submitting",
+        position_id=position.id,
+        exchange=position.exchange,
+        symbol=position.symbol,
+        side=close_side,
+        size=str(size_rounded),
+        ref_price=str(ref_price),
+        aggressive_price=str(aggressive_price),
+        reason=reason,
+        client_order_id=client_order_id,
+    )
+
+    response = await client.post("/exchange/orders", body)
+    vooi_order_id: Optional[str] = None
+    if isinstance(response, dict):
+        vooi_order_id = (
+            str(response.get("orderId") or response.get("id") or "") or None
+        )
+    if vooi_order_id is None:
+        # Mirror the same recovery flow used for entry / trigger placement.
+        vooi_order_id = await lookup_vooi_order_id_by_client_id(
+            client, position.exchange, client_order_id,
+        )
+
+    log.warning(
+        "emergency_close_submitted",
+        position_id=position.id,
+        exchange=position.exchange,
+        symbol=position.symbol,
+        vooi_order_id=vooi_order_id,
+        response=str(response)[:200],
+        reason=reason,
+    )
+    return vooi_order_id
 
 
 def make_client_order_id(signal_id: int, exchange: str, suffix: str = "") -> str:

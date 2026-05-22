@@ -20,11 +20,13 @@ import structlog
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.alerts import send_naked_position_alert
+from bot.alerts import send_emergency_close_alert, send_naked_position_alert
 from bot.config import settings
 from bot.db import session_scope
 from bot.models import Order, Position, Signal
 from bot.orders import (
+    TriggerWouldImmediatelyFireError,
+    emergency_market_close,
     make_client_order_id,
     place_trigger_with_verification,
 )
@@ -255,15 +257,27 @@ async def _place_tp_sl(entry_order_id: int, avg_entry_price: Optional[Decimal]) 
         session.add(sl_order)
         await session.flush()
 
-        sl_placed = await place_trigger_with_verification(
-            client=client,
-            position=position,
-            order_row=sl_order,
-            trigger_type="sl",
-            trigger_price=sl_price_rounded,
-            size=size_rounded,
-            client_order_id=sl_client_oid,
-        )
+        try:
+            sl_placed = await place_trigger_with_verification(
+                client=client,
+                position=position,
+                order_row=sl_order,
+                trigger_type="sl",
+                trigger_price=sl_price_rounded,
+                size=size_rounded,
+                client_order_id=sl_client_oid,
+            )
+        except TriggerWouldImmediatelyFireError as e:
+            # Market has already blown past the intended SL between fill and
+            # placement. Don't retry, don't place TP — dump the position now.
+            await _emergency_close_after_sl_fail(
+                session=session,
+                client=client,
+                position=position,
+                reason="sl_immediate_trigger_post_fill",
+                response_body=e.response_body,
+            )
+            return
 
         # ---------- TP ----------
         tp_client_oid = make_client_order_id(
@@ -379,3 +393,90 @@ async def _place_tp_sl(entry_order_id: int, avg_entry_price: Optional[Decimal]) 
 
 # Trigger placement + verification moved to bot.orders.place_trigger_with_verification
 # (shared with breakeven_watcher / lighter_sl_watchdog).
+
+
+async def _emergency_close_after_sl_fail(
+    *,
+    session: AsyncSession,
+    client,
+    position: Position,
+    reason: str,
+    response_body: str = "",
+) -> None:
+    """
+    Emit `ERROR_NAKED_POSITION`, send aggressive limit-IOC reduce-only to flat
+    the position, mark position closed_emergency in the DB, and loudly alert.
+
+    Caller already holds the per-position lock and an open `session`.
+    Reconciler will fill in `close_price` / `realized_pnl_usd` once VOOI
+    reports the fill.
+    """
+    log.error(
+        "post_fill_sl_would_immediately_fire",
+        position_id=position.id,
+        exchange=position.exchange,
+        symbol=position.symbol,
+        response=response_body[:200],
+    )
+    await emit_event(
+        "ERROR_NAKED_POSITION",
+        level="ERROR",
+        position_id=position.id,
+        exchange=position.exchange,
+        symbol=position.symbol,
+        message=(
+            f"SL placement rejected (trigger would fire immediately) for "
+            f"position {position.id} {position.symbol}. Emergency market-close "
+            f"engaged."
+        ),
+    )
+
+    vooi_order_id: Optional[str] = None
+    try:
+        vooi_order_id = await emergency_market_close(
+            client, position, reason=reason,
+        )
+    except Exception as e:
+        # Worst case — couldn't even place the panic order. Leave the position
+        # naked-but-flagged so sl_safety / reconciler can keep trying, and
+        # SHOUT at the operator.
+        log.error(
+            "emergency_close_post_fill_failed",
+            position_id=position.id,
+            exchange=position.exchange,
+            symbol=position.symbol,
+            error=str(e),
+        )
+        position.status = "open"
+        position.status_updated_at = datetime.now(timezone.utc)
+        await session.flush()
+        await send_naked_position_alert(
+            position.id, position.symbol, position.exchange,
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    position.status = "closed_emergency"
+    position.close_reason = reason
+    position.closed_at = now
+    position.status_updated_at = now
+    await session.flush()
+
+    await emit_event(
+        "EMERGENCY_MARKET_CLOSE",
+        level="ERROR",
+        position_id=position.id,
+        exchange=position.exchange,
+        symbol=position.symbol,
+        message=(
+            f"Emergency limit-IOC close submitted (reason={reason}, "
+            f"vooi_order_id={vooi_order_id})."
+        ),
+    )
+    await send_emergency_close_alert(
+        position.id,
+        position.symbol,
+        position.exchange,
+        reason=reason,
+        vooi_order_id=vooi_order_id,
+    )

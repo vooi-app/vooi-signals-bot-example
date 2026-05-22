@@ -3,6 +3,8 @@ Outbound Telegram alerts to operator.
 Uses plain Telegram Bot API (HTTP, not Telethon).
 If ALERT_TELEGRAM_BOT_TOKEN is empty, alerts are only logged.
 """
+from typing import Optional
+
 import structlog
 import httpx
 
@@ -90,6 +92,26 @@ async def send_naked_position_alert(position_id: int, symbol: str, exchange: str
         f"🚨 <b>ERROR_NAKED_POSITION</b>\n"
         f"Position {position_id}: <b>{symbol}</b> on {exchange}\n"
         f"No active SL order found. Manual intervention required!"
+    )
+    await send_alert(text)
+
+
+async def send_emergency_close_alert(
+    position_id: int,
+    symbol: str,
+    exchange: str,
+    reason: str,
+    *,
+    vooi_order_id: Optional[str] = None,
+) -> None:
+    """Alert when the bot panics out of a position via aggressive limit-IOC."""
+    oid_line = f"\nClose order: <code>{vooi_order_id}</code>" if vooi_order_id else ""
+    text = (
+        f"🆘 <b>EMERGENCY_MARKET_CLOSE</b>\n"
+        f"Position {position_id}: <b>{symbol}</b> on {exchange}\n"
+        f"Reason: {reason}\n"
+        f"SL trigger would fire immediately — bot dumped via aggressive "
+        f"limit-IOC reduce-only.{oid_line}"
     )
     await send_alert(text)
 

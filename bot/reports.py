@@ -131,7 +131,7 @@ async def get_pnl_report(period: str = "week") -> Table:
             select(Position).where(
                 and_(
                     Position.status.in_(
-                        ["closed_tp", "closed_sl", "closed_breakeven", "closed_manual", "liquidated"]
+                        ["closed_tp", "closed_sl", "closed_breakeven", "closed_manual", "closed_emergency", "liquidated"]
                     ),
                     Position.closed_at >= since,
                 )

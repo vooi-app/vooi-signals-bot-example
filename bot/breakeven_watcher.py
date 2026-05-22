@@ -21,11 +21,16 @@ from typing import Optional
 import structlog
 from sqlalchemy import and_, select
 
-from bot.alerts import send_naked_position_alert
+from bot.alerts import send_emergency_close_alert, send_naked_position_alert
 from bot.config import settings
 from bot.db import session_scope
 from bot.models import Order, Position
-from bot.orders import make_client_order_id, place_trigger_with_verification
+from bot.orders import (
+    TriggerWouldImmediatelyFireError,
+    emergency_market_close,
+    make_client_order_id,
+    place_trigger_with_verification,
+)
 from bot.resolver import get_price_decimals, get_size_decimals
 from bot.sse_listener import price_cache, price_cache_updated_at
 from bot.streamer import emit_event
@@ -481,15 +486,82 @@ async def move_sl_to_breakeven(position_id: int) -> None:
         session.add(new_sl_order)
         await session.flush()
 
-        sl_placed = await place_trigger_with_verification(
-            client=client,
-            position=pos,
-            order_row=new_sl_order,
-            trigger_type="sl",
-            trigger_price=be_price_rounded,
-            size=size_rounded,
-            client_order_id=be_sl_client_oid,
-        )
+        try:
+            sl_placed = await place_trigger_with_verification(
+                client=client,
+                position=pos,
+                order_row=new_sl_order,
+                trigger_type="sl",
+                trigger_price=be_price_rounded,
+                size=size_rounded,
+                client_order_id=be_sl_client_oid,
+            )
+        except TriggerWouldImmediatelyFireError as e:
+            # Price reversed past breakeven SL between cancel and re-place —
+            # we've already cancelled the old SL, so we're naked AND the new
+            # SL won't post. Dump immediately at market.
+            log.error(
+                "breakeven_sl_would_immediately_fire",
+                position_id=pos.id,
+                exchange=pos.exchange,
+                symbol=pos.symbol,
+                be_price=str(be_price_rounded),
+                response=e.response_body[:200],
+            )
+            await emit_event(
+                "ERROR_NAKED_POSITION",
+                level="ERROR",
+                position_id=pos.id,
+                exchange=pos.exchange,
+                symbol=pos.symbol,
+                message=(
+                    f"Breakeven SL replacement rejected (trigger would fire "
+                    f"immediately) for position {pos.id} {pos.symbol}. "
+                    f"Emergency market-close engaged."
+                ),
+            )
+
+            vooi_order_id: Optional[str] = None
+            try:
+                vooi_order_id = await emergency_market_close(
+                    client, pos, reason="sl_immediate_trigger_breakeven_move",
+                )
+            except Exception as ex:
+                log.error(
+                    "emergency_close_breakeven_failed",
+                    position_id=pos.id,
+                    exchange=pos.exchange,
+                    symbol=pos.symbol,
+                    error=str(ex),
+                )
+                await send_naked_position_alert(pos.id, pos.symbol, pos.exchange)
+                return
+
+            now = datetime.now(timezone.utc)
+            pos.status = "closed_emergency"
+            pos.close_reason = "sl_immediate_trigger_breakeven_move"
+            pos.closed_at = now
+            pos.status_updated_at = now
+            await session.flush()
+
+            await emit_event(
+                "EMERGENCY_MARKET_CLOSE",
+                level="ERROR",
+                position_id=pos.id,
+                exchange=pos.exchange,
+                symbol=pos.symbol,
+                message=(
+                    f"Emergency limit-IOC close submitted "
+                    f"(reason=sl_immediate_trigger_breakeven_move, "
+                    f"vooi_order_id={vooi_order_id})."
+                ),
+            )
+            await send_emergency_close_alert(
+                pos.id, pos.symbol, pos.exchange,
+                reason="sl_immediate_trigger_breakeven_move",
+                vooi_order_id=vooi_order_id,
+            )
+            return
 
         if not sl_placed:
             log.error(

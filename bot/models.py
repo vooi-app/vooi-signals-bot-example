@@ -211,6 +211,7 @@ class Position(Base):
     # 'closed_sl'           SL hit (original SL)
     # 'closed_breakeven'    BE SL hit
     # 'closed_manual'       operator closed manually
+    # 'closed_emergency'    bot dumped via aggressive limit-IOC (SL would fire immediately)
     # 'liquidated'
     status: Mapped[str] = mapped_column(Text, nullable=False)
 

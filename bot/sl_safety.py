@@ -17,11 +17,20 @@ import structlog
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.alerts import send_naked_position_alert, send_watcher_hung_alert
+from bot.alerts import (
+    send_emergency_close_alert,
+    send_naked_position_alert,
+    send_watcher_hung_alert,
+)
 from bot.config import settings
 from bot.db import session_scope
 from bot.models import Order, Position
-from bot.orders import make_client_order_id, place_trigger_with_verification
+from bot.orders import (
+    TriggerWouldImmediatelyFireError,
+    emergency_market_close,
+    make_client_order_id,
+    place_trigger_with_verification,
+)
 from bot.resolver import (
     MarketDecimalsUnavailable,
     get_price_decimals,
@@ -360,15 +369,25 @@ async def _replace_lighter_sl(
         sl_price=str(sl_price),
     )
 
-    placed = await place_trigger_with_verification(
-        client=client,
-        position=pos,
-        order_row=new_sl,
-        trigger_type="sl",
-        trigger_price=sl_price,
-        size=size_rounded,
-        client_order_id=coid,
-    )
+    try:
+        placed = await place_trigger_with_verification(
+            client=client,
+            position=pos,
+            order_row=new_sl,
+            trigger_type="sl",
+            trigger_price=sl_price,
+            size=size_rounded,
+            client_order_id=coid,
+        )
+    except TriggerWouldImmediatelyFireError as e:
+        await _emergency_close_naked_position(
+            session=session,
+            client=client,
+            pos=pos,
+            reason="sl_immediate_trigger_lighter_watchdog",
+            response_body=e.response_body,
+        )
+        return
 
     if placed:
         pos.sl_order_id = new_sl.id
@@ -590,3 +609,78 @@ async def _replace_tp(
             symbol=pos.symbol,
             attempt=attempt_count,
         )
+
+
+async def _emergency_close_naked_position(
+    *,
+    session: AsyncSession,
+    client,
+    pos: Position,
+    reason: str,
+    response_body: str = "",
+) -> None:
+    """
+    Watchdog couldn't place SL because the trigger would fire immediately —
+    market is already past our intended stop. Dump the position via aggressive
+    limit-IOC reduce-only, mark closed_emergency, and shout at the operator.
+
+    Mirrors `post_fill_placer._emergency_close_after_sl_fail` but operates on
+    an already-open position (sl_safety runs after post-fill has succeeded
+    at one point and TP/SL are tracked).
+    """
+    log.error(
+        "watchdog_sl_would_immediately_fire",
+        position_id=pos.id,
+        exchange=pos.exchange,
+        symbol=pos.symbol,
+        response=response_body[:200],
+    )
+    await emit_event(
+        "ERROR_NAKED_POSITION",
+        level="ERROR",
+        position_id=pos.id,
+        exchange=pos.exchange,
+        symbol=pos.symbol,
+        message=(
+            f"SL replacement rejected (trigger would fire immediately) for "
+            f"position {pos.id} {pos.symbol}. Emergency market-close engaged."
+        ),
+    )
+
+    vooi_order_id: Optional[str] = None
+    try:
+        vooi_order_id = await emergency_market_close(client, pos, reason=reason)
+    except Exception as e:
+        log.error(
+            "emergency_close_watchdog_failed",
+            position_id=pos.id,
+            exchange=pos.exchange,
+            symbol=pos.symbol,
+            error=str(e),
+        )
+        await send_naked_position_alert(pos.id, pos.symbol, pos.exchange)
+        return
+
+    now = datetime.now(timezone.utc)
+    pos.status = "closed_emergency"
+    pos.close_reason = reason
+    pos.closed_at = now
+    pos.status_updated_at = now
+    await session.flush()
+
+    await emit_event(
+        "EMERGENCY_MARKET_CLOSE",
+        level="ERROR",
+        position_id=pos.id,
+        exchange=pos.exchange,
+        symbol=pos.symbol,
+        message=(
+            f"Emergency limit-IOC close submitted (reason={reason}, "
+            f"vooi_order_id={vooi_order_id})."
+        ),
+    )
+    await send_emergency_close_alert(
+        pos.id, pos.symbol, pos.exchange,
+        reason=reason,
+        vooi_order_id=vooi_order_id,
+    )

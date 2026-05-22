@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Optional
 
 import structlog
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
@@ -281,11 +281,20 @@ async def sync_positions_to_exchange(
     if not exchange_state:
         return
 
+    # 'closed_emergency' rows enter here too so that _try_close_from_history
+    # can backfill close_price / realized_pnl_usd from the IOC reduce-only
+    # fill we just sent.
     result = await session.execute(
         select(Position).where(
             and_(
                 Position.exchange.in_(list(exchange_state.keys())),
-                Position.status.in_(["open", "open_pending_tp_sl"]),
+                or_(
+                    Position.status.in_(["open", "open_pending_tp_sl"]),
+                    and_(
+                        Position.status == "closed_emergency",
+                        Position.realized_pnl_usd.is_(None),
+                    ),
+                ),
             )
         )
     )
@@ -409,8 +418,11 @@ async def sync_positions_to_exchange(
             last_synced_at=pos.last_synced_at.isoformat() if pos.last_synced_at else None,
             missing_age_sec=int(missing_age_sec),
         )
-        pos.status = "closed_manual"
-        pos.close_reason = "phantom_no_exchange_position"
+        # Don't downgrade an already-recorded emergency exit to 'closed_manual'
+        # just because the IOC fill hasn't surfaced in /exchange/trades yet.
+        if pos.status != "closed_emergency":
+            pos.status = "closed_manual"
+            pos.close_reason = "phantom_no_exchange_position"
         pos.closed_at = now
         pos.status_updated_at = now
 
@@ -567,15 +579,22 @@ async def _try_close_from_history(
         close_reason = "closed_tp"
     elif sl_vooi and sl_vooi in close_order_ids:
         close_reason = "closed_sl"
+    elif position.status == "closed_emergency":
+        # An emergency-close IOC fill is neither SL nor TP — keep the existing
+        # marker so reports/audits can distinguish panic exits.
+        close_reason = position.close_reason or "closed_emergency"
 
-    # 5. Write back.
+    # 5. Write back. Preserve `closed_emergency` status & close_reason if the
+    # row was flatted via emergency_market_close — we only need the trade
+    # backfill (close_price / pnl / fees) for reports.
     now = datetime.now(timezone.utc)
-    position.status = close_reason
+    if position.status != "closed_emergency":
+        position.status = close_reason
+        position.close_reason = close_reason
     position.close_price = avg_close
     position.realized_pnl_usd = total_realized
     position.fees_paid_usd = total_fees
     position.closed_at = latest_close_ts
-    position.close_reason = close_reason
     position.status_updated_at = now
 
     session.add(Trade(
