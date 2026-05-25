@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import settings
 from bot.db import session_scope
 from bot.models import Order, Position, Trade
-from bot.sse_listener import sse_last_event_at
+from bot import sse_listener as _sse
 from bot.streamer import emit_event
 from bot.vooi_client import get_vooi_client
 
@@ -40,10 +40,15 @@ async def reconciler_run() -> None:
     """Single reconciler run."""
     await emit_event("RECONCILER_RUN", level="DEBUG", message="Reconciler tick")
 
-    sse_silence_sec = time.monotonic() - sse_last_event_at
-    sse_silent = sse_silence_sec > 120  # 2 minutes
-    if sse_silent:
-        log.warning("reconciler_sse_silent", silence_sec=sse_silence_sec)
+    # Read live module-level values (must NOT capture at import time — that
+    # was the bug behind the bogus "silence_sec=258000" warnings).
+    sse_silence_sec = time.monotonic() - _sse.sse_last_frame_at
+    if sse_silence_sec > 120:  # 2 minutes
+        log.warning(
+            "reconciler_sse_silent",
+            silence_sec=sse_silence_sec,
+            connected=_sse.sse_is_connected,
+        )
 
     # Fetch exchange state ONCE per tick — used by orders sync, positions
     # sync, and entry-fill detection so they all see the same snapshot.

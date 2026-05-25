@@ -32,7 +32,18 @@ price_cache: dict[tuple[str, str], Decimal] = {}
 price_cache_updated_at: dict[tuple[str, str], float] = {}
 
 # Last SSE event time — used by reconciler to detect SSE silence
-sse_last_event_at: float = 0.0
+# Time of the most recently dispatched SSE frame. NOT updated on bare
+# (re)connect — a healthy TCP socket that VOOI never pushes events on is the
+# exact failure mode we want this metric to surface. Initialized to monotonic
+# clock at module load so the silence gap is bounded from start (no false
+# `0.0` baseline that makes the reconciler shout from second one).
+sse_last_frame_at: float = time.monotonic()
+
+# Whether we currently hold an open SSE TCP connection (set by
+# _run_sse_connection's connect/disconnect transitions). Read by the
+# reconciler to distinguish "no frames because we're not connected" from
+# "no frames because VOOI is silent on a live socket".
+sse_is_connected: bool = False
 
 
 async def sse_listener_task() -> None:
@@ -65,7 +76,7 @@ async def sse_listener_task() -> None:
 
 async def _run_sse_connection() -> None:
     """Establish and process one SSE connection."""
-    global sse_last_event_at
+    global sse_last_frame_at, sse_is_connected
 
     async with httpx.AsyncClient(
         base_url=settings.vooi_api_base_url,
@@ -75,26 +86,30 @@ async def _run_sse_connection() -> None:
         },
         timeout=httpx.Timeout(None, connect=10.0),
     ) as client:
-        async with aconnect_sse(client, "GET", "/exchange/updates") as event_source:
-            # Reset silence counter on successful connect — VOOI's stream is
-            # idle most of the time (only emits on account events), so we
-            # must not let the previous run's stale timestamp keep firing
-            # `reconciler_sse_silent` warnings forever.
-            sse_last_event_at = time.monotonic()
-            log.info("sse_connected")
-            async for sse in event_source.aiter_sse():
-                sse_last_event_at = time.monotonic()
-                if sse.data:
-                    try:
-                        payload = json.loads(sse.data)
-                        frames = payload if isinstance(payload, list) else [payload]
-                        for frame in frames:
-                            if isinstance(frame, dict):
-                                await dispatch_frame(frame)
-                    except json.JSONDecodeError:
-                        log.debug("sse_non_json_frame", data=sse.data[:100])
-                    except Exception as e:
-                        log.error("sse_frame_dispatch_error", error=str(e))
+        try:
+            async with aconnect_sse(client, "GET", "/exchange/updates") as event_source:
+                sse_is_connected = True
+                log.info("sse_connected")
+                # Deliberately do NOT bump sse_last_frame_at here — the silence
+                # metric must reflect actual frame delivery, not bare TCP
+                # reconnects. VOOI dropping our socket every ~20 min while
+                # pushing zero frames (observed throughout 22–25 May) would
+                # otherwise reset the counter and hide the outage.
+                async for sse in event_source.aiter_sse():
+                    sse_last_frame_at = time.monotonic()
+                    if sse.data:
+                        try:
+                            payload = json.loads(sse.data)
+                            frames = payload if isinstance(payload, list) else [payload]
+                            for frame in frames:
+                                if isinstance(frame, dict):
+                                    await dispatch_frame(frame)
+                        except json.JSONDecodeError:
+                            log.debug("sse_non_json_frame", data=sse.data[:100])
+                        except Exception as e:
+                            log.error("sse_frame_dispatch_error", error=str(e))
+        finally:
+            sse_is_connected = False
 
 
 async def dispatch_frame(frame: dict[str, Any]) -> None:
