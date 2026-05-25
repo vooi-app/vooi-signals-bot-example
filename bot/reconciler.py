@@ -50,12 +50,14 @@ async def reconciler_run() -> None:
     exchange_state = await fetch_exchange_state()
 
     fills_to_dispatch: list[tuple[int, Optional[Decimal]]] = []
+    orphans_to_adopt: list[tuple[int, Optional[Decimal]]] = []
     async with session_scope() as session:
         # Always sync orders and positions against real exchange state. SSE is
         # primary for fast updates but the reconciler is the authoritative
         # ground-truth pass — it catches missed fills, phantom positions, and
         # stale pending entry orders even when SSE is healthy.
         fills_to_dispatch = await sync_orders_to_exchange(session, exchange_state)
+        orphans_to_adopt = await adopt_orphan_exchange_positions(session, exchange_state)
         await sync_positions_to_exchange(session, exchange_state)
         await cancel_expired_limit_orders(session)
 
@@ -63,9 +65,10 @@ async def reconciler_run() -> None:
     # Each on_entry_filled opens its own session and writes to the same rows
     # we just updated — running it inside the parent tx caused row-lock
     # deadlocks on the second aster fill (2026-05-18 & -19 silent stalls).
-    if fills_to_dispatch:
+    all_dispatch = list(fills_to_dispatch) + list(orphans_to_adopt)
+    if all_dispatch:
         from bot.post_fill_placer import on_entry_filled
-        for entry_order_id, avg_price in fills_to_dispatch:
+        for entry_order_id, avg_price in all_dispatch:
             try:
                 await on_entry_filled(entry_order_id, avg_price)
             except Exception as e:
@@ -259,6 +262,147 @@ async def sync_orders_to_exchange(
     # its own session — without this, the second aster fill in a tick stalls
     # forever in row-lock contention against the still-open parent tx).
     return fills_to_dispatch
+
+
+async def adopt_orphan_exchange_positions(
+    session: AsyncSession,
+    exchange_state: dict[str, dict],
+) -> list[tuple[int, Optional[Decimal]]]:
+    """
+    Defensive sweep that catches missed entry-fill transitions starting from
+    *exchange* state rather than from our orders table.
+
+    For every non-zero exchange position on every exchange we have state for:
+      - If a positions row already exists in 'open' / 'open_pending_tp_sl' /
+        'closed_emergency' for (exchange, symbol) → already tracked, skip.
+      - Otherwise locate a tracked entry order (status in pending/submitting/
+        filled-but-no-position) for (exchange, symbol, side) with size within
+        5%. Mark it filled (if not already), and return its id so the caller
+        dispatches `on_entry_filled` — which creates the position row and
+        places SL/TP.
+
+    Why this exists alongside `sync_orders_to_exchange`: the orders-out path
+    requires `vooi_order_id` to be known and the position to actually appear
+    in `/exchange/positions`. Edge cases (vooi_order_id mismatch after a
+    rejected-then-replaced flow, brief race between fill and position
+    materialisation, post_fill_placer crash before position row commits) can
+    leave a live exchange position with no DB row. Walking the live positions
+    list closes that loop.
+    """
+    if not exchange_state:
+        return []
+
+    adoptions: list[tuple[int, Optional[Decimal]]] = []
+    now = datetime.now(timezone.utc)
+
+    for exchange, data in exchange_state.items():
+        for ex_pos in data.get("positions", []) or []:
+            if not isinstance(ex_pos, dict):
+                continue
+            symbol = str(
+                ex_pos.get("baseSymbol") or ex_pos.get("asset")
+                or ex_pos.get("symbol") or ""
+            ).upper()
+            if not symbol:
+                continue
+            try:
+                size_raw = Decimal(str(ex_pos.get("size") or ex_pos.get("qty") or 0))
+            except Exception:
+                continue
+            if size_raw == 0:
+                continue
+            ex_size = abs(size_raw)
+
+            # Exchange sometimes reports `side` as long/short, sometimes
+            # buy/sell, sometimes only via sign of size. Normalise.
+            raw_side = str(ex_pos.get("side") or "").lower()
+            if raw_side in ("long", "buy"):
+                ex_side = "buy"
+            elif raw_side in ("short", "sell"):
+                ex_side = "sell"
+            else:
+                ex_side = "buy" if size_raw > 0 else "sell"
+
+            # Already tracked?
+            tracked_q = await session.execute(
+                select(Position).where(
+                    and_(
+                        Position.exchange == exchange,
+                        Position.symbol == symbol,
+                        Position.status.in_(
+                            ["open", "open_pending_tp_sl", "closed_emergency"]
+                        ),
+                    )
+                )
+            )
+            if tracked_q.scalars().first() is not None:
+                continue
+
+            # Find a candidate entry order. Prefer `filled` (no position row
+            # yet means post_fill_placer didn't finish); fall back to
+            # `pending`/`submitting` (sync_orders_to_exchange should have
+            # promoted these already, but here we are).
+            entry_q = await session.execute(
+                select(Order).where(
+                    and_(
+                        Order.exchange == exchange,
+                        Order.symbol == symbol,
+                        Order.side == ex_side,
+                        Order.order_type == "entry",
+                        Order.status.in_(["filled", "pending", "submitting"]),
+                    )
+                ).order_by(Order.id.desc())
+            )
+            candidates = entry_q.scalars().all()
+
+            entry_order: Optional[Order] = None
+            for cand in candidates:
+                cand_size = cand.size or Decimal("0")
+                if cand_size == 0:
+                    continue
+                drift = abs(cand_size - ex_size) / cand_size
+                if drift <= Decimal("0.05"):
+                    entry_order = cand
+                    break
+
+            if entry_order is None:
+                log.warning(
+                    "orphan_position_no_candidate_entry",
+                    exchange=exchange,
+                    symbol=symbol,
+                    side=ex_side,
+                    size=str(ex_size),
+                )
+                continue
+
+            avg_price_raw = ex_pos.get("entryPrice")
+            avg_price: Optional[Decimal] = None
+            if avg_price_raw is not None:
+                try:
+                    avg_price = Decimal(str(avg_price_raw))
+                except Exception:
+                    avg_price = None
+
+            if entry_order.status != "filled":
+                entry_order.status = "filled"
+                entry_order.filled_at = now
+                entry_order.filled_size = ex_size
+                if avg_price is not None and avg_price > 0:
+                    entry_order.avg_fill_price = avg_price
+
+            log.warning(
+                "orphan_position_adopting",
+                exchange=exchange,
+                symbol=symbol,
+                side=ex_side,
+                size=str(ex_size),
+                entry_order_id=entry_order.id,
+                vooi_order_id=entry_order.vooi_order_id,
+            )
+            adoptions.append((entry_order.id, avg_price))
+
+    await session.flush()
+    return adoptions
 
 
 async def sync_positions_to_exchange(

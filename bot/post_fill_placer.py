@@ -298,15 +298,29 @@ async def _place_tp_sl(entry_order_id: int, avg_entry_price: Optional[Decimal]) 
         session.add(tp_order)
         await session.flush()
 
-        tp_placed = await place_trigger_with_verification(
-            client=client,
-            position=position,
-            order_row=tp_order,
-            trigger_type="tp",
-            trigger_price=tp_price_rounded,
-            size=size_rounded,
-            client_order_id=tp_client_oid,
-        )
+        try:
+            tp_placed = await place_trigger_with_verification(
+                client=client,
+                position=position,
+                order_row=tp_order,
+                trigger_type="tp",
+                trigger_price=tp_price_rounded,
+                size=size_rounded,
+                client_order_id=tp_client_oid,
+            )
+        except TriggerWouldImmediatelyFireError as e:
+            # Market is already past the profit target — take the win at
+            # market via the same panic-close path. The SL we just placed
+            # would otherwise sit until market reverses through it.
+            await _emergency_close_after_tp_fail(
+                session=session,
+                client=client,
+                position=position,
+                sl_order=sl_order if sl_placed else None,
+                reason="tp_immediate_trigger_post_fill",
+                response_body=e.response_body,
+            )
+            return
 
         # Wire up position regardless of partial failure — sl_safety_check
         # will detect a missing SL within 30s and fire ERROR_NAKED_POSITION
@@ -465,6 +479,105 @@ async def _emergency_close_after_sl_fail(
     await emit_event(
         "EMERGENCY_MARKET_CLOSE",
         level="ERROR",
+        position_id=position.id,
+        exchange=position.exchange,
+        symbol=position.symbol,
+        message=(
+            f"Emergency limit-IOC close submitted (reason={reason}, "
+            f"vooi_order_id={vooi_order_id})."
+        ),
+    )
+    await send_emergency_close_alert(
+        position.id,
+        position.symbol,
+        position.exchange,
+        reason=reason,
+        vooi_order_id=vooi_order_id,
+    )
+
+
+async def _emergency_close_after_tp_fail(
+    *,
+    session: AsyncSession,
+    client,
+    position: Position,
+    sl_order: Optional[Order],
+    reason: str,
+    response_body: str = "",
+) -> None:
+    """
+    TP placement rejected because the trigger would fire immediately —
+    market is already past our profit target. Cancel the freshly-placed
+    SL (it would otherwise sit on a closed position and could re-trigger
+    after re-entry on the same symbol), flat the position at market via
+    aggressive limit-IOC, mark closed_emergency, alert.
+    """
+    log.warning(
+        "post_fill_tp_would_immediately_fire",
+        position_id=position.id,
+        exchange=position.exchange,
+        symbol=position.symbol,
+        response=response_body[:200],
+    )
+
+    # Best-effort cancel of the SL we placed seconds ago. A dangling SL on a
+    # closed position is mostly harmless (reduceOnly=true), but startup_cleanup
+    # will flag it on next restart — better to clean up now.
+    if sl_order is not None and sl_order.vooi_order_id:
+        try:
+            await client.delete(
+                "/exchange/orders",
+                json_body={
+                    "exchange": position.exchange,
+                    "asset": position.symbol,
+                    "orderId": sl_order.vooi_order_id,
+                },
+            )
+            sl_order.status = "cancelled"
+            sl_order.cancelled_at = datetime.now(timezone.utc)
+        except Exception as e:
+            log.warning(
+                "post_fill_tp_sl_cancel_failed",
+                position_id=position.id,
+                sl_order_id=sl_order.id,
+                vooi_order_id=sl_order.vooi_order_id,
+                error=str(e),
+            )
+
+    vooi_order_id: Optional[str] = None
+    try:
+        vooi_order_id = await emergency_market_close(
+            client, position, reason=reason,
+        )
+    except Exception as e:
+        log.error(
+            "emergency_close_after_tp_fail_failed",
+            position_id=position.id,
+            exchange=position.exchange,
+            symbol=position.symbol,
+            error=str(e),
+        )
+        # No SL placement either — fall back to NAKED alert. Caller has
+        # already wired SL via place_trigger_with_verification when this is
+        # reached so we record what we know.
+        position.status = "open"
+        position.status_updated_at = datetime.now(timezone.utc)
+        await session.flush()
+        await send_naked_position_alert(
+            position.id, position.symbol, position.exchange,
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    position.status = "closed_emergency"
+    position.close_reason = reason
+    position.closed_at = now
+    position.status_updated_at = now
+    await session.flush()
+
+    await emit_event(
+        "EMERGENCY_MARKET_CLOSE",
+        level="WARNING",
         position_id=position.id,
         exchange=position.exchange,
         symbol=position.symbol,

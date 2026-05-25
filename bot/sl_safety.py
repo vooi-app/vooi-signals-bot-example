@@ -570,15 +570,28 @@ async def _replace_tp(
         tp_price=str(tp_price),
     )
 
-    placed = await place_trigger_with_verification(
-        client=client,
-        position=pos,
-        order_row=new_tp,
-        trigger_type="tp",
-        trigger_price=tp_price,
-        size=size_rounded,
-        client_order_id=coid,
-    )
+    try:
+        placed = await place_trigger_with_verification(
+            client=client,
+            position=pos,
+            order_row=new_tp,
+            trigger_type="tp",
+            trigger_price=tp_price,
+            size=size_rounded,
+            client_order_id=coid,
+        )
+    except TriggerWouldImmediatelyFireError as e:
+        # Market has moved past our profit target while we were not watching.
+        # Take the profit at market instead of re-trying a stale trigger price
+        # every 30s forever.
+        await _emergency_close_take_profit(
+            session=session,
+            client=client,
+            pos=pos,
+            reason="tp_immediate_trigger_watchdog",
+            response_body=e.response_body,
+        )
+        return
 
     if placed:
         pos.tp_order_id = new_tp.id
@@ -671,6 +684,91 @@ async def _emergency_close_naked_position(
     await emit_event(
         "EMERGENCY_MARKET_CLOSE",
         level="ERROR",
+        position_id=pos.id,
+        exchange=pos.exchange,
+        symbol=pos.symbol,
+        message=(
+            f"Emergency limit-IOC close submitted (reason={reason}, "
+            f"vooi_order_id={vooi_order_id})."
+        ),
+    )
+    await send_emergency_close_alert(
+        pos.id, pos.symbol, pos.exchange,
+        reason=reason,
+        vooi_order_id=vooi_order_id,
+    )
+
+
+async def _emergency_close_take_profit(
+    *,
+    session: AsyncSession,
+    client,
+    pos: Position,
+    reason: str,
+    response_body: str = "",
+) -> None:
+    """
+    Watchdog tried to place a fresh TP and got -2021 — price has moved past
+    the profit target. Take the win at market via aggressive limit-IOC and
+    cancel the existing SL so it doesn't sit unattached after the close.
+    """
+    log.warning(
+        "tp_watchdog_would_immediately_fire",
+        position_id=pos.id,
+        exchange=pos.exchange,
+        symbol=pos.symbol,
+        response=response_body[:200],
+    )
+
+    # Cancel the live SL (if any) — reduceOnly safeguards a stray fill, but
+    # an orphan SL on a closed position triggers startup_cleanup noise next
+    # restart, so clean it up here.
+    if pos.sl_order_id:
+        sl_res = await session.execute(select(Order).where(Order.id == pos.sl_order_id))
+        sl_o = sl_res.scalar_one_or_none()
+        if sl_o and sl_o.vooi_order_id and sl_o.status in ("pending", "open", "submitting"):
+            try:
+                await client.delete(
+                    "/exchange/orders",
+                    json_body={
+                        "exchange": pos.exchange,
+                        "asset": pos.symbol,
+                        "orderId": sl_o.vooi_order_id,
+                    },
+                )
+                sl_o.status = "cancelled"
+                sl_o.cancelled_at = datetime.now(timezone.utc)
+            except Exception as e:
+                log.warning(
+                    "tp_watchdog_sl_cancel_failed",
+                    position_id=pos.id,
+                    sl_order_id=sl_o.id,
+                    error=str(e),
+                )
+
+    vooi_order_id: Optional[str] = None
+    try:
+        vooi_order_id = await emergency_market_close(client, pos, reason=reason)
+    except Exception as e:
+        log.error(
+            "emergency_close_tp_watchdog_failed",
+            position_id=pos.id,
+            exchange=pos.exchange,
+            symbol=pos.symbol,
+            error=str(e),
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    pos.status = "closed_emergency"
+    pos.close_reason = reason
+    pos.closed_at = now
+    pos.status_updated_at = now
+    await session.flush()
+
+    await emit_event(
+        "EMERGENCY_MARKET_CLOSE",
+        level="WARNING",
         position_id=pos.id,
         exchange=pos.exchange,
         symbol=pos.symbol,
