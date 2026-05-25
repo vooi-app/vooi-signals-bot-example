@@ -409,8 +409,8 @@ async def emergency_market_close(
     close_side = opposite_side(position.side)
     size = position.size
     try:
-        price_decimals = await get_price_decimals(client, position.exchange, position.symbol)
-        size_decimals = await get_size_decimals(client, position.exchange, position.symbol)
+        price_decimals = await get_price_decimals(position.symbol, position.exchange)
+        size_decimals = await get_size_decimals(position.symbol, position.exchange)
     except MarketDecimalsUnavailable as e:
         log.error(
             "emergency_close_decimals_unavailable",
