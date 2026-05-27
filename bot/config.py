@@ -125,6 +125,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_file_path: str = "./logs/bot.log"
     vooi_raw_log_path: str = "./logs/vooi-raw.log"
+    aster_debug_log_path: str = "./logs/aster-debug.log"
     log_retention_days: int = 30
 
     # -------------------------------------------------------------------------

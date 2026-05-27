@@ -96,6 +96,21 @@ async def send_naked_position_alert(position_id: int, symbol: str, exchange: str
     await send_alert(text)
 
 
+async def send_orphan_naked_alert(
+    symbol: str, exchange: str, side: str, size: str
+) -> None:
+    """Alert for a live exchange position the bot cannot attribute to any
+    tracked entry order — so there is no position row and no SL/TP. This is
+    the most dangerous untracked state: real exposure the bot is blind to."""
+    text = (
+        f"🚨 <b>ERROR_NAKED_POSITION (untracked orphan)</b>\n"
+        f"<b>{symbol}</b> {side} {size} on {exchange}\n"
+        f"Live position on the exchange with NO matching entry order — bot "
+        f"cannot place SL/TP for it. Close it manually or check the key."
+    )
+    await send_alert(text)
+
+
 async def send_emergency_close_alert(
     position_id: int,
     symbol: str,

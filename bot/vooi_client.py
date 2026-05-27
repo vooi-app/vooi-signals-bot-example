@@ -17,7 +17,11 @@ import httpx
 import structlog
 
 from bot.config import settings
-from bot.vooi_audit import insert_api_call_log, insert_error_log
+from bot.vooi_audit import (
+    insert_api_call_log,
+    insert_error_log,
+    log_aster_request_sent,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -112,9 +116,28 @@ class VooiClient:
         if json_body is not None:
             request_body_str = json.dumps(json_body)
 
+        # Snapshot redacted request headers — Authorization is masked but the
+        # rest (User-Agent, Content-Type, Accept) are useful when comparing
+        # successful vs failed aster requests.
+        request_headers_redacted = _redact_auth(dict(self._client.headers))
+        # Full URL for the file log (path + base url + querystring)
+        full_url = str(self._client.build_request(method, path, params=params).url)
+
         last_exc: Optional[Exception] = None
 
         for attempt in range(1, _MAX_RETRIES + 1):
+            # Pre-flight aster log: written BEFORE the network call so we have
+            # a record even on timeout / connection error.
+            await log_aster_request_sent(
+                correlation_id=correlation_id,
+                method=method,
+                url=full_url,
+                request_headers=request_headers_redacted,
+                request_body=request_body_str,
+                params=params,
+                attempt=attempt,
+            )
+
             start_ms = time.monotonic()
             response: Optional[httpx.Response] = None
 
@@ -128,6 +151,7 @@ class VooiClient:
                 duration_ms = int((time.monotonic() - start_ms) * 1000)
                 status = response.status_code
                 response_text = response.text[:4096]  # cap stored response size
+                response_headers_dict = dict(response.headers)
 
                 # Log every call
                 await insert_api_call_log(
@@ -138,6 +162,10 @@ class VooiClient:
                     response_status=status,
                     response_body=response_text,
                     duration_ms=duration_ms,
+                    request_headers=request_headers_redacted,
+                    response_headers=response_headers_dict,
+                    params=params,
+                    attempt=attempt,
                 )
 
                 if status in _RETRY_STATUS_CODES and attempt < _MAX_RETRIES:
@@ -171,6 +199,10 @@ class VooiClient:
                         response_status=status,
                         response_body=response_text,
                         duration_ms=duration_ms,
+                        request_headers=request_headers_redacted,
+                        response_headers=response_headers_dict,
+                        params=params,
+                        attempt=attempt,
                     )
                     response.raise_for_status()
 
@@ -196,6 +228,10 @@ class VooiClient:
                         response_status=status,
                         response_body=response_text,
                         duration_ms=duration_ms2,
+                        request_headers=request_headers_redacted,
+                        response_headers=response_headers_dict,
+                        params=params,
+                        attempt=attempt,
                     )
                     raise
 
@@ -212,6 +248,10 @@ class VooiClient:
                     response_status=None,
                     response_body=None,
                     duration_ms=duration_ms,
+                    request_headers=request_headers_redacted,
+                    response_headers=None,
+                    params=params,
+                    attempt=attempt,
                 )
                 if attempt < _MAX_RETRIES:
                     backoff = _BASE_BACKOFF_SEC * (2 ** (attempt - 1))
@@ -238,6 +278,10 @@ class VooiClient:
                     response_status=None,
                     response_body=None,
                     duration_ms=duration_ms,
+                    request_headers=request_headers_redacted,
+                    response_headers=None,
+                    params=params,
+                    attempt=attempt,
                 )
                 raise
 
@@ -257,6 +301,10 @@ class VooiClient:
                     response_status=None,
                     response_body=None,
                     duration_ms=duration_ms,
+                    request_headers=request_headers_redacted,
+                    response_headers=None,
+                    params=params,
+                    attempt=attempt,
                 )
                 raise
 

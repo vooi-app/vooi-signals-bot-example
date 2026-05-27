@@ -13,6 +13,7 @@ import structlog
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.alerts import send_orphan_naked_alert
 from bot.config import settings
 from bot.db import session_scope
 from bot.models import Order, Position, Trade
@@ -21,6 +22,20 @@ from bot.streamer import emit_event
 from bot.vooi_client import get_vooi_client
 
 log = structlog.get_logger(__name__)
+
+# De-dup for un-adoptable orphan alerts: key -> last alert monotonic time.
+# Without this the reconciler would fire a Telegram alert every tick (~90s)
+# for the same naked orphan. Re-alert at most once per hour while it persists.
+_orphan_alert_sent_at: dict[tuple[str, str, str], float] = {}
+_ORPHAN_ALERT_INTERVAL_SEC = 3600.0
+
+# Throttle the /exchange/trades backstop sweep: each lost entry order is
+# checked at most once per this interval. Most expired/cancelled entries never
+# filled, so re-querying /trades for them every reconciler tick would be pure
+# API waste. A late-surfacing fill (AGT filled ~2h after expiry) is still
+# caught well within this window.
+_history_fill_checked_at: dict[int, float] = {}
+_HISTORY_FILL_CHECK_INTERVAL_SEC = 600.0
 
 
 async def reconciler_task() -> None:
@@ -56,6 +71,7 @@ async def reconciler_run() -> None:
 
     fills_to_dispatch: list[tuple[int, Optional[Decimal]]] = []
     orphans_to_adopt: list[tuple[int, Optional[Decimal]]] = []
+    history_fills: list[tuple[int, Optional[Decimal]]] = []
     async with session_scope() as session:
         # Always sync orders and positions against real exchange state. SSE is
         # primary for fast updates but the reconciler is the authoritative
@@ -63,14 +79,18 @@ async def reconciler_run() -> None:
         # stale pending entry orders even when SSE is healthy.
         fills_to_dispatch = await sync_orders_to_exchange(session, exchange_state)
         orphans_to_adopt = await adopt_orphan_exchange_positions(session, exchange_state)
+        # Backstop: catch fills that /positions + SSE missed but /trades shows
+        # (AGT incident — VOOI position-vs-trade desync). Runs after adopt so
+        # live positions are already handled and excluded here.
+        history_fills = await detect_entry_fills_from_history(session, exchange_state)
         await sync_positions_to_exchange(session, exchange_state)
-        await cancel_expired_limit_orders(session)
+        await cancel_expired_limit_orders(session, exchange_state)
 
     # Dispatch post-fill placement AFTER the reconciler's transaction commits.
     # Each on_entry_filled opens its own session and writes to the same rows
     # we just updated — running it inside the parent tx caused row-lock
     # deadlocks on the second aster fill (2026-05-18 & -19 silent stalls).
-    all_dispatch = list(fills_to_dispatch) + list(orphans_to_adopt)
+    all_dispatch = list(fills_to_dispatch) + list(orphans_to_adopt) + list(history_fills)
     if all_dispatch:
         from bot.post_fill_placer import on_entry_filled
         for entry_order_id, avg_price in all_dispatch:
@@ -269,6 +289,33 @@ async def sync_orders_to_exchange(
     return fills_to_dispatch
 
 
+async def _alert_unadoptable_orphan(
+    exchange: str, symbol: str, side: str, size: str
+) -> None:
+    """Fire ERROR_NAKED_POSITION for a live position with no matching entry,
+    de-duped to at most once per hour per (exchange, symbol, side)."""
+    key = (exchange, symbol, side)
+    last = _orphan_alert_sent_at.get(key, 0.0)
+    if time.monotonic() - last < _ORPHAN_ALERT_INTERVAL_SEC:
+        return
+    _orphan_alert_sent_at[key] = time.monotonic()
+
+    await emit_event(
+        "ERROR_NAKED_POSITION",
+        level="ERROR",
+        exchange=exchange,
+        symbol=symbol,
+        message=(
+            f"Untracked live {side} position {size} {symbol} on {exchange} "
+            f"with no matching entry order — bot cannot place SL/TP."
+        ),
+    )
+    try:
+        await send_orphan_naked_alert(symbol, exchange, side, size)
+    except Exception as e:
+        log.error("orphan_naked_alert_failed", symbol=symbol, exchange=exchange, error=str(e))
+
+
 async def adopt_orphan_exchange_positions(
     session: AsyncSession,
     exchange_state: dict[str, dict],
@@ -347,6 +394,13 @@ async def adopt_orphan_exchange_positions(
             # yet means post_fill_placer didn't finish); fall back to
             # `pending`/`submitting` (sync_orders_to_exchange should have
             # promoted these already, but here we are).
+            #
+            # We also accept `expired` and `cancelled_reconciler`: a live
+            # exchange position with a same-side, same-size entry that we
+            # marked expired/cancelled means our local state desynced from
+            # reality — e.g. a TTL cancel whose DELETE failed (aster 401), so
+            # the order stayed live on the exchange and later filled. The live
+            # position + ≤5% size match is strong enough evidence to revive it.
             entry_q = await session.execute(
                 select(Order).where(
                     and_(
@@ -354,7 +408,10 @@ async def adopt_orphan_exchange_positions(
                         Order.symbol == symbol,
                         Order.side == ex_side,
                         Order.order_type == "entry",
-                        Order.status.in_(["filled", "pending", "submitting"]),
+                        Order.status.in_(
+                            ["filled", "pending", "submitting",
+                             "expired", "cancelled_reconciler"]
+                        ),
                     )
                 ).order_by(Order.id.desc())
             )
@@ -371,6 +428,9 @@ async def adopt_orphan_exchange_positions(
                     break
 
             if entry_order is None:
+                # No entry order can explain this live position. It is real,
+                # unprotected exposure the bot is blind to — escalate loudly
+                # (de-duped) instead of just logging a warning every tick.
                 log.warning(
                     "orphan_position_no_candidate_entry",
                     exchange=exchange,
@@ -378,6 +438,7 @@ async def adopt_orphan_exchange_positions(
                     side=ex_side,
                     size=str(ex_size),
                 )
+                await _alert_unadoptable_orphan(exchange, symbol, ex_side, str(ex_size))
                 continue
 
             avg_price_raw = ex_pos.get("entryPrice")
@@ -388,10 +449,17 @@ async def adopt_orphan_exchange_positions(
                 except Exception:
                     avg_price = None
 
+            # An entry we had written off (expired / cancelled) but which
+            # actually filled — flag the revival distinctly from a normal
+            # missed-fill adoption so the desync is visible in the logs.
+            prev_status = entry_order.status
+            revived = prev_status in ("expired", "cancelled_reconciler")
+
             if entry_order.status != "filled":
                 entry_order.status = "filled"
                 entry_order.filled_at = now
                 entry_order.filled_size = ex_size
+                entry_order.cancelled_at = None
                 if avg_price is not None and avg_price > 0:
                     entry_order.avg_fill_price = avg_price
 
@@ -403,11 +471,173 @@ async def adopt_orphan_exchange_positions(
                 size=str(ex_size),
                 entry_order_id=entry_order.id,
                 vooi_order_id=entry_order.vooi_order_id,
+                revived_from_status=prev_status if revived else None,
             )
             adoptions.append((entry_order.id, avg_price))
 
     await session.flush()
     return adoptions
+
+
+async def detect_entry_fills_from_history(
+    session: AsyncSession,
+    exchange_state: dict[str, dict],
+) -> list[tuple[int, Optional[Decimal]]]:
+    """
+    Backstop fill detection keyed off /exchange/trades rather than
+    /exchange/positions or SSE.
+
+    Motivation (AGT incident, 2026-05-26): a limit entry filled on aster at
+    19:02 but VOOI's /exchange/positions did not surface the position for ~13h
+    (and SSE pushed no fill frame), while /exchange/trades showed the fill
+    immediately. adopt_orphan_exchange_positions starts from live positions,
+    so it was blind for the whole window. This sweep starts from our own
+    pending/written-off entry orders and asks "did this actually fill?" using
+    the one endpoint that knew.
+
+    For each entry order with a vooi_order_id, no position row, and no live
+    exchange position (those belong to adopt_orphan), we look it up in
+    /exchange/trades:
+      - entry fill not present  → never filled; leave it (TTL owns cancels).
+      - entry fill present, position already closed → reconstruct the close
+        via _try_close_from_history (records the closed position + trade for
+        PnL completeness; no protective orders needed).
+      - entry fill present, no close yet → the position is LIVE but invisible
+        in /positions. Mark filled and return it so the caller dispatches
+        on_entry_filled, which places SL/TP — closing the naked-position gap.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=72)
+    result = await session.execute(
+        select(Order).where(
+            and_(
+                Order.order_type == "entry",
+                Order.vooi_order_id.is_not(None),
+                Order.status.in_(
+                    ["pending", "submitting", "expired", "cancelled_reconciler"]
+                ),
+                Order.created_at > cutoff,
+            )
+        )
+    )
+    lost_entries = result.scalars().all()
+    if not lost_entries:
+        return []
+
+    client = get_vooi_client()
+    recovered: list[tuple[int, Optional[Decimal]]] = []
+    now = datetime.now(timezone.utc)
+
+    def _parse_ts(s: str) -> Optional[datetime]:
+        try:
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    for order in lost_entries:
+        # Already has a position row → nothing to recover.
+        existing = await session.execute(
+            select(Position.id).where(Position.entry_order_id == order.id)
+        )
+        if existing.scalars().first() is not None:
+            continue
+
+        # A live exchange position is adopt_orphan's job — don't double-handle.
+        if _exchange_position_for(exchange_state, order.exchange, order.symbol) is not None:
+            continue
+
+        # Throttle: skip orders checked within the last interval.
+        last_checked = _history_fill_checked_at.get(order.id, 0.0)
+        if time.monotonic() - last_checked < _HISTORY_FILL_CHECK_INTERVAL_SEC:
+            continue
+        _history_fill_checked_at[order.id] = time.monotonic()
+
+        try:
+            resp = await client.get(
+                "/exchange/trades",
+                params={"exchanges": order.exchange, "symbol": order.symbol},
+            )
+        except Exception as e:
+            log.warning(
+                "entry_fill_history_fetch_failed",
+                order_id=order.id, symbol=order.symbol, error=str(e),
+            )
+            continue
+
+        items = resp.get("items", []) if isinstance(resp, dict) else []
+        entry_trade = next(
+            (t for t in items if str(t.get("orderId")) == str(order.vooi_order_id)),
+            None,
+        )
+        if entry_trade is None:
+            continue  # genuinely never filled
+
+        try:
+            entry_price = Decimal(str(entry_trade.get("price") or 0))
+        except Exception:
+            entry_price = order.price or Decimal("0")
+        if entry_price <= 0:
+            entry_price = order.price or Decimal("0")
+        try:
+            entry_size = abs(Decimal(str(entry_trade.get("size") or 0)))
+        except Exception:
+            entry_size = order.size or Decimal("0")
+        if entry_size <= 0:
+            entry_size = order.size or Decimal("0")
+        entry_ts = _parse_ts(entry_trade.get("createdAt") or "") or now
+
+        prev_status = order.status
+        order.status = "filled"
+        order.filled_at = entry_ts
+        order.filled_size = entry_size
+        order.avg_fill_price = entry_price
+        order.cancelled_at = None
+
+        position = Position(
+            signal_id=order.signal_id,
+            entry_order_id=order.id,
+            exchange=order.exchange,
+            symbol=order.symbol,
+            side=order.side,
+            entry_price=entry_price,
+            size=entry_size,
+            leverage=order.leverage or settings.default_leverage,
+            margin_mode=settings.default_margin_mode,
+            status="open_pending_tp_sl",
+            opened_at=entry_ts,
+            status_updated_at=now,
+            sl_strategy="fixed",
+        )
+        session.add(position)
+        await session.flush()
+
+        log.warning(
+            "entry_fill_recovered_from_history",
+            order_id=order.id,
+            position_id=position.id,
+            exchange=order.exchange,
+            symbol=order.symbol,
+            side=order.side,
+            entry_price=str(entry_price),
+            size=str(entry_size),
+            prev_status=prev_status,
+        )
+
+        # Already closed? _try_close_from_history finalizes status/pnl/trade.
+        try:
+            closed = await _try_close_from_history(session, position)
+        except Exception as e:
+            log.warning(
+                "entry_fill_recovered_close_check_failed",
+                position_id=position.id, error=str(e),
+            )
+            closed = False
+
+        if not closed:
+            # Live but hidden from /positions → dispatch SL/TP placement.
+            recovered.append((order.id, entry_price))
+
+    await session.flush()
+    return recovered
 
 
 async def sync_positions_to_exchange(
@@ -821,10 +1051,24 @@ async def retry_pending_tp_sl() -> None:
         await on_entry_filled(entry_order.id, avg)
 
 
-async def cancel_expired_limit_orders(session: AsyncSession) -> None:
+async def cancel_expired_limit_orders(
+    session: AsyncSession,
+    exchange_state: Optional[dict[str, dict]] = None,
+) -> None:
     """
     Cancel entry limit orders older than LIMIT_ORDER_TTL_HOURS.
     Per spec: auto-cancel stale unfilled orders.
+
+    Two guards prevent the AGT-class desync (2026-05-26):
+      1. If a live exchange position exists for (exchange, symbol), the order
+         almost certainly filled — never expire it. The fill/adoption paths
+         own that transition.
+      2. Only mark `expired` when the cancel is *confirmed* (2xx) or the order
+         is already gone (404). On any other failure (e.g. aster 401) leave
+         the order untouched so it is retried next tick and — crucially —
+         remains a live candidate the exchange may still fill. Force-marking
+         it expired on a failed DELETE is what previously stranded a filled
+         position as an un-adoptable naked orphan.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.limit_order_ttl_hours)
 
@@ -843,6 +1087,18 @@ async def cancel_expired_limit_orders(session: AsyncSession) -> None:
     client = get_vooi_client()
 
     for order in expired_orders:
+        # Guard 1: a live position means the order filled — don't expire it.
+        if exchange_state is not None and _exchange_position_for(
+            exchange_state, order.exchange, order.symbol
+        ) is not None:
+            log.info(
+                "reconciler_expiry_skipped_position_live",
+                order_id=order.id,
+                exchange=order.exchange,
+                symbol=order.symbol,
+            )
+            continue
+
         log.info(
             "reconciler_cancelling_expired_order",
             order_id=order.id,
@@ -850,6 +1106,9 @@ async def cancel_expired_limit_orders(session: AsyncSession) -> None:
             created_at=str(order.created_at),
         )
 
+        # Guard 2: only mark expired when the cancel is confirmed or the order
+        # is already gone. `cancel_confirmed` stays False on any other error.
+        cancel_confirmed = order.vooi_order_id is None  # nothing to cancel
         if order.vooi_order_id:
             try:
                 await client.delete(
@@ -860,14 +1119,21 @@ async def cancel_expired_limit_orders(session: AsyncSession) -> None:
                         "orderId": order.vooi_order_id,
                     },
                 )
+                cancel_confirmed = True
             except Exception as e:
-                log.warning(
-                    "reconciler_cancel_failed",
-                    order_id=order.id,
-                    error=str(e),
-                )
+                err = str(e).lower()
+                if "404" in err or "not found" in err:
+                    # Already gone on the exchange — safe to finalize.
+                    cancel_confirmed = True
+                else:
+                    log.warning(
+                        "reconciler_cancel_failed",
+                        order_id=order.id,
+                        error=str(e),
+                    )
 
-        order.status = "expired"
-        order.cancelled_at = datetime.now(timezone.utc)
+        if cancel_confirmed:
+            order.status = "expired"
+            order.cancelled_at = datetime.now(timezone.utc)
 
     await session.flush()
