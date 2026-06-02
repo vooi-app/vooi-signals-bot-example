@@ -61,6 +61,9 @@ def compute_tp_price(
         cost_overhead_pct = floor_pct
     total_pct = required_gain_pct + cost_overhead_pct
 
+    # Widen the base TP by a fixed % of price (symmetric with the SL widening).
+    total_pct = total_pct + Decimal(str(settings.base_extra_distance_pct)) / Decimal("100")
+
     if side == "buy":
         return avg_entry_price * (Decimal("1") + total_pct)
     else:
@@ -133,7 +136,20 @@ def compute_tp_price_with_fallback(
     """
     Compute TP price with automatic fallback when quotes are unavailable.
     Uses conservative one-way exit slippage of 5 bps when no quote.
+
+    When SYMMETRIC_TP_SL is enabled, TP distance is forced to equal the SL
+    distance (1:1 risk:reward) — the cost-based target below is bypassed. This
+    fixes the inverted payoff (TP tighter than SL) that made average losses
+    exceed average wins. SL distance (≥2%) dwarfs the fee/slippage overhead, so
+    the mirrored TP is still comfortably net-profitable.
     """
+    if settings.symmetric_tp_sl:
+        factor = compute_sl_distance_factor(leverage, exchange=exchange)
+        if side == "buy":
+            return avg_entry_price * (Decimal("1") + factor)
+        else:
+            return avg_entry_price * (Decimal("1") - factor)
+
     if quote_fees_bps is not None:
         fees_rt = exit_fees_bps_round_trip(quote_fees_bps)
     else:
@@ -159,6 +175,7 @@ def compute_sl_price_from_pct(
     side: str,
     leverage: int,
     sl_pct: Optional[Decimal] = None,
+    min_distance_pct: Optional[Decimal] = None,
 ) -> Decimal:
     """
     Compute SL price from a collateral-loss target.
@@ -167,14 +184,71 @@ def compute_sl_price_from_pct(
     targets MIN_PROFIT_PCT_OF_COLLATERAL). The corresponding price distance
     is `sl_pct / leverage` — e.g. SL=7%, lev=5 → 1.4% from entry; lev=10 →
     0.7% from entry.
+
+    `min_distance_pct` (% of PRICE) floors that distance. On low-liquidity
+    venues the raw distance can be tighter than normal post-fill noise, so the
+    market blows past the stop before it lands and the exchange rejects it as
+    "would immediately trigger". Pass settings.get_min_sl_distance_pct(exchange)
+    to widen the stop outside that band; 0 / None keeps the raw distance.
     """
-    pct = sl_pct if sl_pct is not None else Decimal(str(settings.default_sl_pct))
-    factor = (pct / Decimal("100")) / Decimal(str(leverage))
+    factor = compute_sl_distance_factor(
+        leverage, sl_pct=sl_pct, min_distance_pct=min_distance_pct
+    )
 
     if side == "buy":
         return entry_price * (Decimal("1") - factor)
     else:
         return entry_price * (Decimal("1") + factor)
+
+
+def compute_sl_distance_factor(
+    leverage: int,
+    exchange: Optional[str] = None,
+    sl_pct: Optional[Decimal] = None,
+    min_distance_pct: Optional[Decimal] = None,
+) -> Decimal:
+    """
+    The SL distance from entry as a fraction of PRICE — the single source of
+    truth for how far the stop sits. Used by both `compute_sl_price_from_pct`
+    and (when SYMMETRIC_TP_SL is on) the TP calculator so TP mirrors SL exactly.
+
+    = default_sl_pct/leverage + BASE_EXTRA_DISTANCE_PCT, then floored by the
+    per-exchange MIN_SL_DISTANCE_PCT. Pass `min_distance_pct` explicitly, or
+    `exchange` to look it up; if neither is given the floor is skipped.
+    """
+    pct = sl_pct if sl_pct is not None else Decimal(str(settings.default_sl_pct))
+    factor = (pct / Decimal("100")) / Decimal(str(leverage))
+
+    # Widen the base SL by a fixed % of price (symmetric with the TP widening),
+    # before applying the per-exchange floor so a higher floor still wins.
+    factor = factor + Decimal(str(settings.base_extra_distance_pct)) / Decimal("100")
+
+    if min_distance_pct is None and exchange is not None:
+        min_distance_pct = settings.get_min_sl_distance_pct(exchange)
+    if min_distance_pct is not None and min_distance_pct > 0:
+        floor = Decimal(str(min_distance_pct)) / Decimal("100")
+        if floor > factor:
+            factor = floor
+
+    return factor
+
+
+def sl_would_immediately_trigger(
+    side: str, sl_price: Decimal, current_price: Decimal
+) -> bool:
+    """
+    True if a stop-loss at `sl_price` would fire immediately at `current_price`.
+
+    A long's SL is a sell-stop (fires when price falls to it) → it must sit
+    BELOW market. A short's SL is a buy-stop (fires when price rises to it) →
+    it must sit ABOVE market. Mirrors the exchange-side -2021 rejection so we
+    can pre-check before touching the live SL.
+    """
+    if side == "buy":
+        return current_price <= sl_price
+    elif side == "sell":
+        return current_price >= sl_price
+    raise ValueError(f"Unknown side: {side}")
 
 
 def round_price(price: Decimal, decimals: int, side: str) -> Decimal:

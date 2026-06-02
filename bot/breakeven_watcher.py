@@ -51,6 +51,11 @@ tp_breakeven_watcher_last_tick: float = 0.0
 
 _SUPERVISOR_INTERVAL_SEC = 10
 
+# Clearance the current price must have over the breakeven SL before we move
+# it, as a fraction of price. Keeps the BE move off the immediate-trigger
+# boundary so a tiny retrace between guard and placement doesn't reject it.
+_BREAKEVEN_REQUOTE_BUFFER_PCT = Decimal("0.001")  # 0.1% of price
+
 
 # -----------------------------------------------------------------------------
 # In-memory trigger index
@@ -187,7 +192,7 @@ async def _fire_breakeven_safely(trigger: _BreakevenTrigger, observed_price: Dec
         )
 
         try:
-            await move_sl_to_breakeven(trigger.position_id)
+            await move_sl_to_breakeven(trigger.position_id, observed_price=observed_price)
         except Exception as e:
             log.error(
                 "breakeven_fire_error",
@@ -364,13 +369,20 @@ async def _rescue_stale_sse_positions() -> None:
 # -----------------------------------------------------------------------------
 # Breakeven move
 # -----------------------------------------------------------------------------
-async def move_sl_to_breakeven(position_id: int) -> None:
+async def move_sl_to_breakeven(
+    position_id: int, observed_price: Optional[Decimal] = None
+) -> None:
     """
     Cancel the live SL and place a new one at entry + safety buffer.
 
     Steps per spec §8.8:
     1. Idempotency guard: sl_moved_to_be_at IS NOT NULL → return.
     2. Compute breakeven SL price.
+    2b. Re-quote guard: if the BE-SL would immediately trigger at the current
+        market (price retraced back through breakeven after the trigger spike),
+        DEFER — keep the live protective SL untouched and let the evaluator
+        retry on a later tick. Prevents the cancel-then-dump race that flattened
+        positions at scratch on volatile venues (aster -2021).
     3. Cancel existing SL order (abort if cancel cannot be confirmed).
     4. Place new SL (reduce-only) via the verified-trigger helper.
     5. On race (404 on cancel) → position already closed.
@@ -378,6 +390,9 @@ async def move_sl_to_breakeven(position_id: int) -> None:
        sl_moved_to_be_at, so the SSE evaluator will retry on the next price.
     7. On success, update position (sl_order_id, sl_price_current,
        sl_moved_to_be_at) and emit SL_BREAKEVEN.
+
+    `observed_price` is the SSE tick that fired the trigger; passed through to
+    avoid an extra REST quote. Falls back to a REST quote if not supplied.
     """
     async with session_scope() as session:
         result = await session.execute(
@@ -407,6 +422,41 @@ async def move_sl_to_breakeven(position_id: int) -> None:
         size_rounded = round_size(pos.size, size_decimals)
 
         client = get_vooi_client()
+
+        # Re-quote guard (step 2b): a BE move that would immediately fire means
+        # price has retraced back through breakeven since the trigger spike.
+        # Cancelling the live SL to place a doomed BE-SL leaves us naked and
+        # forces a scratch dump. Instead defer: keep the protective SL in place
+        # and let the evaluator retry once price clears breakeven for real.
+        current_price = observed_price
+        if current_price is None:
+            try:
+                current_price = Decimal(
+                    str(await client.get_current_price(pos.symbol, pos.exchange))
+                )
+            except Exception as e:
+                log.debug(
+                    "breakeven_requote_guard_price_unavailable",
+                    position_id=pos.id, error=str(e),
+                )
+                current_price = None
+
+        if current_price is not None:
+            buffer = _BREAKEVEN_REQUOTE_BUFFER_PCT
+            if pos.side == "buy":
+                clear = current_price > be_price_rounded * (Decimal("1") + buffer)
+            else:
+                clear = current_price < be_price_rounded * (Decimal("1") - buffer)
+            if not clear:
+                log.info(
+                    "breakeven_move_deferred_would_immediately_fire",
+                    position_id=pos.id,
+                    exchange=pos.exchange,
+                    symbol=pos.symbol,
+                    be_price=str(be_price_rounded),
+                    current=str(current_price),
+                )
+                return  # protective SL untouched; sl_moved_to_be_at stays NULL → retry
 
         # Cancel existing SL order. We must confirm cancel before placing a
         # new SL — two SLs on the book would double-close on the first hit.
@@ -497,16 +547,95 @@ async def move_sl_to_breakeven(position_id: int) -> None:
                 client_order_id=be_sl_client_oid,
             )
         except TriggerWouldImmediatelyFireError as e:
-            # Price reversed past breakeven SL between cancel and re-place —
-            # we've already cancelled the old SL, so we're naked AND the new
-            # SL won't post. Dump immediately at market.
-            log.error(
-                "breakeven_sl_would_immediately_fire",
+            # Residual race: price retraced through breakeven in the window
+            # between our confirmed cancel and the re-place, so the BE-SL would
+            # fire immediately. We're momentarily naked. DON'T scratch-dump the
+            # position (the old behaviour). After a retrace toward entry the
+            # ORIGINAL (wider) stop is comfortably clear of market, so restore
+            # protection there and leave sl_moved_to_be_at NULL → BE retries on
+            # a later tick. Emergency close is now only the last resort if even
+            # the original level would immediately fire (price genuinely past
+            # the protective stop too).
+            log.warning(
+                "breakeven_sl_would_immediately_fire_restoring",
                 position_id=pos.id,
                 exchange=pos.exchange,
                 symbol=pos.symbol,
                 be_price=str(be_price_rounded),
                 response=e.response_body[:200],
+            )
+
+            restored = False
+            restore_price = None
+            if pos.sl_price_initial is not None:
+                restore_price = round_price(
+                    Decimal(str(pos.sl_price_initial)),
+                    price_decimals,
+                    opposite_side(pos.side),
+                )
+                restore_coid = make_client_order_id(
+                    pos.signal_id or 0, pos.exchange, suffix="rsl"
+                )
+                restore_order = Order(
+                    signal_id=pos.signal_id,
+                    client_order_id=restore_coid,
+                    order_type="stopLoss",
+                    exchange=pos.exchange,
+                    symbol=pos.symbol,
+                    side=opposite_side(pos.side),
+                    status="submitting",
+                    trigger_price=restore_price,
+                    size=size_rounded,
+                    reduce_only=True,
+                )
+                session.add(restore_order)
+                await session.flush()
+                try:
+                    restored = await place_trigger_with_verification(
+                        client=client,
+                        position=pos,
+                        order_row=restore_order,
+                        trigger_type="sl",
+                        trigger_price=restore_price,
+                        size=size_rounded,
+                        client_order_id=restore_coid,
+                    )
+                except TriggerWouldImmediatelyFireError:
+                    restored = False
+
+            if restored:
+                pos.sl_order_id = restore_order.id
+                pos.sl_price_current = restore_price
+                pos.last_synced_at = datetime.now(timezone.utc)
+                await session.flush()
+                log.info(
+                    "breakeven_protection_restored",
+                    position_id=pos.id,
+                    symbol=pos.symbol,
+                    sl_price=str(restore_price),
+                )
+                await emit_event(
+                    "SL_RESTORED",
+                    level="WARNING",
+                    position_id=pos.id,
+                    signal_id=pos.signal_id,
+                    exchange=pos.exchange,
+                    symbol=pos.symbol,
+                    message=(
+                        f"BE move deferred (would fire immediately); protective "
+                        f"SL restored @ {restore_price} for pos={pos.id}. "
+                        f"Will retry breakeven."
+                    ),
+                )
+                return  # sl_moved_to_be_at stays NULL → BE retried next tick
+
+            # Could not restore protection either → genuine emergency.
+            log.error(
+                "breakeven_sl_restore_failed_emergency",
+                position_id=pos.id,
+                exchange=pos.exchange,
+                symbol=pos.symbol,
+                be_price=str(be_price_rounded),
             )
             await emit_event(
                 "ERROR_NAKED_POSITION",
@@ -516,8 +645,9 @@ async def move_sl_to_breakeven(position_id: int) -> None:
                 symbol=pos.symbol,
                 message=(
                     f"Breakeven SL replacement rejected (trigger would fire "
-                    f"immediately) for position {pos.id} {pos.symbol}. "
-                    f"Emergency market-close engaged."
+                    f"immediately) for position {pos.id} {pos.symbol} and "
+                    f"protective SL could not be restored. Emergency "
+                    f"market-close engaged."
                 ),
             )
 

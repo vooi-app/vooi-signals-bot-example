@@ -130,7 +130,12 @@ async def _ensure_position_for_fill(
     ):
         sl_initial = Decimal(str(signal_row.stop_loss))
     else:
-        sl_initial = compute_sl_price_from_pct(entry_price, side, leverage)
+        sl_initial = compute_sl_price_from_pct(
+            entry_price,
+            side,
+            leverage,
+            min_distance_pct=settings.get_min_sl_distance_pct(entry_order.exchange),
+        )
 
     now = datetime.now(timezone.utc)
     position = Position(
@@ -230,7 +235,12 @@ async def _place_tp_sl(entry_order_id: int, avg_entry_price: Optional[Decimal]) 
         if position.sl_price_initial is not None:
             sl_price = position.sl_price_initial
         else:
-            sl_price = compute_sl_price_from_pct(position.entry_price, side, leverage)
+            sl_price = compute_sl_price_from_pct(
+                position.entry_price,
+                side,
+                leverage,
+                min_distance_pct=settings.get_min_sl_distance_pct(position.exchange),
+            )
 
         tp_price_rounded = round_price(tp_price, price_decimals, exit_side)
         sl_price_rounded = round_price(sl_price, price_decimals, exit_side)

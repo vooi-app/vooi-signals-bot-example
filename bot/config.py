@@ -62,6 +62,34 @@ class Settings(BaseSettings):
     # what the signal author asked for.
     use_signal_sl: bool = False
 
+    # MIN_SL_DISTANCE_PCT (per exchange): floor on the SL distance from entry,
+    # expressed as % of PRICE (not margin). The raw stop is default_sl_pct /
+    # leverage (e.g. 5%/5x = 1% of price); on low-liquidity venues that is
+    # routinely *inside* normal post-fill noise, so the market blows past it
+    # between fill and SL placement and the exchange rejects the trigger as
+    # "would immediately trigger" (aster -2021) → the position is dumped.
+    # This floor widens the stop so it sits outside that noise band.
+    # 0 = disabled (keep the raw default_sl_pct / leverage distance).
+    min_sl_distance_pct_hyperliquid: Decimal = Decimal("0")
+    min_sl_distance_pct_lighter: Decimal = Decimal("0")
+    min_sl_distance_pct_aster: Decimal = Decimal("2.5")
+
+    # BASE_EXTRA_DISTANCE_PCT: extra distance added to BOTH the base TP and the
+    # base SL, as % of PRICE, widening the default levels symmetrically across
+    # all exchanges. Base SL (default_sl_pct / leverage) and base TP (profit
+    # target + cost overhead) each get pushed this much further from entry.
+    # Applied to the SL BEFORE the per-exchange MIN_SL_DISTANCE_PCT floor, so on
+    # venues with a higher floor the floor still wins. 0 = disabled.
+    base_extra_distance_pct: Decimal = Decimal("1")
+
+    # SYMMETRIC_TP_SL: force the TP distance to equal the SL distance (1:1
+    # risk:reward), bypassing the cost-based TP target. The old TP (profit
+    # target + overhead) came out TIGHTER than the SL, so average losses
+    # exceeded average wins and the strategy bled even at a decent win rate.
+    # With this on, TP mirrors the exact SL distance per exchange (incl. the
+    # MIN_SL_DISTANCE_PCT floor). Set False to restore the cost-based TP.
+    symmetric_tp_sl: bool = True
+
     # -------------------------------------------------------------------------
     # Take Profit
     # -------------------------------------------------------------------------
@@ -147,6 +175,17 @@ class Settings(BaseSettings):
             "hyperliquid": self.min_notional_usd_hyperliquid,
             "lighter": self.min_notional_usd_lighter,
             "aster": self.min_notional_usd_aster,
+        }
+        result = mapping.get(exchange.lower())
+        if result is None:
+            raise ValueError(f"Unknown exchange: {exchange}")
+        return result
+
+    def get_min_sl_distance_pct(self, exchange: str) -> Decimal:
+        mapping = {
+            "hyperliquid": self.min_sl_distance_pct_hyperliquid,
+            "lighter": self.min_sl_distance_pct_lighter,
+            "aster": self.min_sl_distance_pct_aster,
         }
         result = mapping.get(exchange.lower())
         if result is None:

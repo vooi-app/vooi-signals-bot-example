@@ -64,6 +64,11 @@ def setup_logging() -> None:
 def run() -> None:
     """Start all bot tasks (ingester, SSE, reconciler, watchers)."""
     setup_logging()
+    # Capture silent-death crashes (faulthandler + sys/threading excepthook +
+    # atexit + signal handlers). Writes to logs/crash.log, separate from
+    # harness stdout. See bot/crash_diagnostics.py.
+    from bot.crash_diagnostics import install_diagnostics
+    install_diagnostics(os.path.dirname(settings.log_file_path) or "logs")
     console.print("[bold green]Starting VOOI Signal Bot...[/bold green]")
     asyncio.run(_run_all_tasks())
 
@@ -81,6 +86,10 @@ async def _run_all_tasks() -> None:
         tp_safety_watchdog_task,
     )
     from bot.startup_cleanup import run_startup_cleanup
+
+    # Install asyncio loop-level exception handler now that the loop exists.
+    from bot.crash_diagnostics import install_asyncio_handler
+    install_asyncio_handler(asyncio.get_running_loop())
 
     # Run alembic migrations on startup
     await _run_migrations()
@@ -105,10 +114,32 @@ async def _run_all_tasks() -> None:
 
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        # asyncio.wait returns on FIRST_EXCEPTION *or* when a task finishes
+        # normally. The latter should never happen — every task is an infinite
+        # supervisor — so a clean return is itself a bug worth surfacing.
         for task in done:
-            if task.exception():
+            exc = task.exception()
+            if exc is not None:
                 console.print(
-                    f"[bold red]Task {task.get_name()} failed: {task.exception()}[/bold red]"
+                    f"[bold red]Task {task.get_name()} failed: {exc}[/bold red]"
+                )
+                log.error(
+                    "task_failed_in_wait",
+                    task_name=task.get_name(),
+                    exc_type=type(exc).__name__,
+                    exception=repr(exc),
+                )
+            else:
+                # Supervisor returned without raising. This is anomalous for
+                # an infinite task and is one possible silent-death path.
+                result_repr = repr(task.result())[:300]
+                console.print(
+                    f"[bold yellow]Task {task.get_name()} returned (no exception): {result_repr}[/bold yellow]"
+                )
+                log.error(
+                    "task_returned_normally_unexpected",
+                    task_name=task.get_name(),
+                    result=result_repr,
                 )
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
@@ -562,7 +593,12 @@ async def _signal_dryrun(message_id: int) -> None:
         sl = parsed.get("stop_loss")
         sl_price = (
             Decimal(str(sl)) if sl
-            else compute_sl_price_from_pct(avg_entry, side, leverage)
+            else compute_sl_price_from_pct(
+                avg_entry,
+                side,
+                leverage,
+                min_distance_pct=settings.get_min_sl_distance_pct(route_result.exchange),
+            )
         )
 
         console.print(f"  Entry: {avg_entry}")

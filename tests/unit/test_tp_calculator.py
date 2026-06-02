@@ -25,6 +25,13 @@ def get_settings_mock():
         fee_fallback_taker_bps_hyperliquid = Decimal("4.5")
         fee_fallback_taker_bps_lighter = Decimal("0.0")
         fee_fallback_taker_bps_aster = Decimal("3.5")
+        # Level-widening knobs disabled here so these tests exercise the pure
+        # cost-based formula; production defaults differ (see .env.example).
+        base_extra_distance_pct = Decimal("0")
+        symmetric_tp_sl = False
+        min_sl_distance_pct_hyperliquid = Decimal("0")
+        min_sl_distance_pct_lighter = Decimal("0")
+        min_sl_distance_pct_aster = Decimal("0")
 
         def get_broker_fee_bps(self, exchange: str) -> str:
             mapping = {
@@ -33,6 +40,9 @@ def get_settings_mock():
                 "aster": self.vooi_broker_fee_bps_aster,
             }
             return mapping[exchange.lower()]
+
+        def get_min_sl_distance_pct(self, exchange: str) -> Decimal:
+            return Decimal("0")
     return MockSettings()
 
 

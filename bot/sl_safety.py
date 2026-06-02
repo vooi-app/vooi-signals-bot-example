@@ -337,7 +337,10 @@ async def _replace_lighter_sl(
     sl_price_raw: Optional[Decimal] = pos.sl_price_current or pos.sl_price_initial
     if sl_price_raw is None:
         sl_price_raw = compute_sl_price_from_pct(
-            pos.entry_price, pos.side, pos.leverage
+            pos.entry_price,
+            pos.side,
+            pos.leverage,
+            min_distance_pct=settings.get_min_sl_distance_pct(pos.exchange),
         )
 
     exit_side = opposite_side(pos.side)
