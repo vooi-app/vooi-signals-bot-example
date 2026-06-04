@@ -145,7 +145,7 @@ All three need the same credentials.
 ### Prerequisites
 
 - A Telegram account; app credentials from <https://my.telegram.org/apps>.
-- A VOOI Ultra API key and broker IDs for each exchange. Contact the VOOI team.
+- A VOOI Ultra API key from <https://ultra.vooi.io/api-tokens>.
 - An OpenAI-compatible API key (defaults to `gpt-4o-mini`).
 - Python **3.11+** and PostgreSQL **15+** (Docker bundles both).
 
@@ -163,7 +163,7 @@ Edit `.env` and fill in:
 | Field | Where to get it |
 |---|---|
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | <https://my.telegram.org/apps> |
-| `VOOI_API_KEY` | VOOI team |
+| `VOOI_API_KEY` | <https://ultra.vooi.io/api-tokens> |
 | `LLM_API_KEY` | OpenAI / Anthropic / Azure-OpenAI key |
 | `POSTGRES_PASSWORD` and matching `DATABASE_URL` | Choose your own |
 | `ALERT_TELEGRAM_BOT_TOKEN` / `_CHAT_ID` (optional) | Create via @BotFather, get chat id from @userinfobot |
