@@ -20,11 +20,6 @@
 # @some_signals_channel
 # @another_premium_group
 
-# Curated starter set — public Telegram crypto signal channels that came out
-# slightly positive in author's own 10-day live run (May 2026). Sample sizes
-# are small (3–7 closed trades each) and channel quality drifts over time, so
-# treat these as a starting point, not a recommendation. Always verify
-# results on your own account before scaling.
-@binance_360
-@CryptoHeaven
-@vip_profits
+# No channels are bundled. Add your own above — research and vet each source
+# yourself; channel quality drifts over time and past results do not predict
+# future performance.

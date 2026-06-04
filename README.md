@@ -1,3 +1,13 @@
+> **Disclaimer**
+>
+> These examples are provided for educational purposes only. They are not financial advice and do not guarantee profit.
+>
+> The current bot examples were generated with AI-assisted development and tested before publication. They demonstrate how VOOI Ultra users can quickly prototype trading bots and agentic trading workflows using VOOI Perps API access available through VOOI Ultra.
+>
+> Testing does not make the bots risk-free. Trading bots can place real orders and interact with real funds. Review the code, configuration, strategy, and risk controls before running any bot with live capital.
+
+---
+
 # VOOI Signal Bot
 
 Automated crypto-futures trading bot that ingests trading signals from Telegram channels, parses them with an LLM, and routes orders to perpetual exchanges (Hyperliquid, Lighter, Aster) via the [VOOI Ultra API](https://perps-api.vooi.io).
